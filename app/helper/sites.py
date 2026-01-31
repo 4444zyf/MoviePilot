@@ -21,27 +21,28 @@ def _load_original():
     # - sites.cpython-312-aarch64-linux-gnu.so (Linux ARM64)
     # - sites.cpython-312-darwin.so (macOS)
     # - sites.cpython-312-x86_64-linux-gnu.so (Linux x86_64)
+    # Load from _compiled subdirectory to avoid Python importing .so directly
     patterns = [
-        'sites.cpython-312-darwin.so',            # macOS
-        'sites.cpython-312-x86_64-linux-gnu.so',  # Linux x86_64
-        'sites.cpython-312-aarch64-linux-gnu.so', # Linux ARM64
-        'sites.cp312-win_amd64.pyd',              # Windows
+        '_compiled/sites.cpython-312-darwin.so',            # macOS
+        '_compiled/sites.cpython-312-x86_64-linux-gnu.so',  # Linux x86_64
+        '_compiled/sites.cpython-312-aarch64-linux-gnu.so', # Linux ARM64
+        '_compiled/sites.cp312-win_amd64.pyd',              # Windows
     ]
 
     for filename in patterns:
         compiled_path = helper_dir / filename
         if compiled_path.exists():
-            spec = importlib.util.spec_from_file_location("_sites_original", compiled_path)
+            spec = importlib.util.spec_from_file_location("sites", compiled_path)
             _original_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(_original_module)
             _OriginalSitesHelper = _original_module.SitesHelper
             return
 
-    raise ImportError("Cannot find compiled sites module (sites.cpython-*.so or sites.*.pyd)")
+    raise ImportError("Cannot find compiled sites module in _compiled/ directory")
 
 
 class SitesHelper:
-    """Wrapper around original SitesHelper - bypasses auth_level and check_user"""
+    """Wrapper around original compiled SitesHelper - bypasses authentication checks"""
 
     def __init__(self):
         _load_original()
