@@ -1,7 +1,8 @@
-"""
-SitesHelper wrapper - bypasses user authentication while preserving all other functionality.
+"""SitesHelper wrapper - bypasses user authentication while preserving all other functionality.
 """
 import importlib.util
+import platform
+import sys
 from pathlib import Path
 from typing import Tuple, Dict, Any
 
@@ -16,29 +17,33 @@ def _load_original():
         return
 
     helper_dir = Path(__file__).parent
-    # Actual compiled module filenames (from MoviePilot-Resources):
-    # - sites.cp312-win_amd64.pyd (Windows)
-    # - sites.cpython-312-aarch64-linux-gnu.so (Linux ARM64)
-    # - sites.cpython-312-darwin.so (macOS)
-    # - sites.cpython-312-x86_64-linux-gnu.so (Linux x86_64)
-    # Load from _compiled subdirectory to avoid Python importing .so directly
-    patterns = [
-        '_compiled/sites.cpython-312-darwin.so',            # macOS
-        '_compiled/sites.cpython-312-x86_64-linux-gnu.so',  # Linux x86_64
-        '_compiled/sites.cpython-312-aarch64-linux-gnu.so', # Linux ARM64
-        '_compiled/sites.cp312-win_amd64.pyd',              # Windows
-    ]
-
-    for filename in patterns:
-        compiled_path = helper_dir / filename
-        if compiled_path.exists():
-            spec = importlib.util.spec_from_file_location("sites", compiled_path)
-            _original_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(_original_module)
-            _OriginalSitesHelper = _original_module.SitesHelper
-            return
-
-    raise ImportError("Cannot find compiled sites module in _compiled/ directory")
+    
+    # Detect platform and architecture
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    
+    # Map platform to expected compiled module filename
+    # Pattern: sites.cpython-{py_version}-{platform}-{arch}.so
+    if system == 'darwin':  # macOS
+        filename = '_compiled/sites.cpython-312-darwin.so'
+    elif system == 'linux':
+        if 'aarch64' in machine or 'arm64' in machine:
+            filename = '_compiled/sites.cpython-312-aarch64-linux-gnu.so'
+        else:  # x86_64, amd64, etc.
+            filename = '_compiled/sites.cpython-312-x86_64-linux-gnu.so'
+    elif system == 'windows':
+        filename = '_compiled/sites.cp312-win_amd64.pyd'
+    else:
+        raise ImportError(f"Unsupported platform: {system} {machine}")
+    
+    compiled_path = helper_dir / filename
+    if not compiled_path.exists():
+        raise ImportError(f"Cannot find compiled sites module for {system} {machine}: {compiled_path}")
+    
+    spec = importlib.util.spec_from_file_location("sites", compiled_path)
+    _original_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_original_module)
+    _OriginalSitesHelper = _original_module.SitesHelper
 
 
 class SitesHelper:
