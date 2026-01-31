@@ -1,4 +1,5 @@
 .idea/
+.qoder/
 *.c
 *.so
 *.pyd
@@ -8,7 +9,6 @@ dist/
 nginx/
 test.py
 safety_report.txt
-app/helper/sites.py
 app/helper/*.so
 app/helper/*.pyd
 app/helper/*.bin
