@@ -90,7 +90,8 @@ RUN FRONTEND_VERSION=$(sed -n "s/^FRONTEND_VERSION\s*=\s*'\([^']*\)'/\1/p" /app/
 FROM prepare_package AS final
 
 # python 环境
-COPY --from=prepare_venv --chmod=777 ${VENV_PATH} ${VENV_PATH}
+COPY --from=prepare_venv ${VENV_PATH} ${VENV_PATH}
+RUN chmod -R 777 ${VENV_PATH}
 
 # playwright 环境
 RUN playwright install-deps chromium \
