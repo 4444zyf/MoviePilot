@@ -81,26 +81,26 @@ class FileManagerModule(_ModuleBase):
                 return False, f"{d.name} 的下载目录未设置"
             if d.storage == "local" and not Path(download_path).exists():
                 return False, f"{d.name} 的下载目录 {download_path} 不存在"
-            # 媒体库目录
+            # 仅在启用整理时检查媒体库目录
             library_path = d.library_path
-            if not library_path:
-                return False, f"{d.name} 的媒体库目录未设置"
-            if d.library_storage == "local" and not Path(library_path).exists():
-                return False, f"{d.name} 的媒体库目录 {library_path} 不存在"
-            # 硬链接
-            if d.transfer_type == "link" \
-                    and d.storage == "local" \
-                    and d.library_storage == "local" \
-                    and not SystemUtils.is_same_disk(Path(download_path), Path(library_path)):
-                return False, f"{d.name} 的下载目录 {download_path} 与媒体库目录 {library_path} 不在同一磁盘，无法硬链接"
+            if d.transfer_type:
+                if not library_path:
+                    return False, f"{d.name} 的媒体库目录未设置"
+                if d.library_storage == "local" and not Path(library_path).exists():
+                    return False, f"{d.name} 的媒体库目录 {library_path} 不存在"
+                # 硬链接
+                if d.transfer_type == "link" \
+                        and d.storage == "local" \
+                        and d.library_storage == "local" \
+                        and not SystemUtils.is_same_disk(Path(download_path), Path(library_path)):
+                    return False, f"{d.name} 的下载目录 {download_path} 与媒体库目录 {library_path} 不在同一磁盘，无法硬链接"
             # 存储
             storage_oper = self.__get_storage_oper(d.storage)
-            if not storage_oper:
-                return False, f"{d.name} 的存储类型 {d.storage} 不支持"
-            if not storage_oper.check():
-                return False, f"{d.name} 的存储测试不通过"
-            if d.transfer_type and d.transfer_type not in storage_oper.support_transtype():
-                return False, f"{d.name} 的存储不支持 {d.transfer_type} 整理方式"
+            if storage_oper:
+                if not storage_oper.check():
+                    return False, f"{d.name} 的存储测试不通过"
+                if d.transfer_type and d.transfer_type not in storage_oper.support_transtype():
+                    return False, f"{d.name} 的存储不支持 {d.transfer_type} 整理方式"
 
         return True, ""
 
@@ -299,6 +299,18 @@ class FileManagerModule(_ModuleBase):
             return None
         return storage_oper.create_folder(fileitem, name)
 
+    def get_folder(self, storage: str, path: Path) -> Optional[FileItem]:
+        """
+        获取目录，如目录不存在则创建
+        """
+        if storage not in self._support_storages:
+            return None
+        storage_oper = self.__get_storage_oper(storage)
+        if not storage_oper:
+            logger.error(f"不支持 {storage} 的目录获取")
+            return None
+        return storage_oper.get_folder(path)
+
     def delete_file(self, fileitem: FileItem) -> Optional[bool]:
         """
         删除文件或目录
@@ -406,7 +418,8 @@ class FileManagerModule(_ModuleBase):
                  transfer_type: Optional[str] = None, scrape: Optional[bool] = None,
                  library_type_folder: Optional[bool] = None, library_category_folder: Optional[bool] = None,
                  episodes_info: List[TmdbEpisode] = None,
-                 source_oper: Callable = None, target_oper: Callable = None) -> TransferInfo:
+                 source_oper: Callable = None, target_oper: Callable = None,
+                 preview: Optional[bool] = False) -> TransferInfo:
         """
         文件整理
         :param fileitem:  文件信息
@@ -522,6 +535,7 @@ class FileManagerModule(_ModuleBase):
                                       need_notify=need_notify,
                                       overwrite_mode=overwrite_mode,
                                       episodes_info=episodes_info,
+                                      preview=preview,
                                       source_oper=source_oper,
                                       target_oper=target_oper)
 
@@ -592,8 +606,12 @@ class FileManagerModule(_ModuleBase):
         """
         判断媒体文件是否存在于文件系统（网盘或本地文件），只支持标准媒体库结构
         :param mediainfo:  识别的媒体信息
+        :param server:  指定媒体服务器名称时跳过本地文件系统检查
         :return: 如不存在返回None，存在时返回信息，包括每季已存在所有集{type: movie/tv, seasons: {season: [episodes]}}
         """
+        if kwargs.get("server"):
+            return None
+
         if not settings.LOCAL_EXISTS_SEARCH:
             return None
 
@@ -614,7 +632,7 @@ class FileManagerModule(_ModuleBase):
             seasons: Dict[int, list] = {}
             for fileitem in fileitems:
                 file_meta = MetaInfo(fileitem.basename)
-                season_index = file_meta.begin_season or 1
+                season_index = file_meta.begin_season if file_meta.begin_season is not None else 1
                 episode_index = file_meta.begin_episode
                 if not episode_index:
                     continue

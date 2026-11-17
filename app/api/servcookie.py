@@ -1,10 +1,11 @@
 import gzip
+import hmac
 import json
 from typing import Annotated, Callable, Any, Dict, Optional
 
 import aiofiles
 from anyio import Path as AsyncPath
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request, Response
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Request, Response
 from fastapi.responses import PlainTextResponse
 from fastapi.routing import APIRoute
 
@@ -15,7 +16,6 @@ from app.utils.crypto import CryptoJsUtils, HashUtils
 
 
 class GzipRequest(Request):
-
     async def body(self) -> bytes:
         if not hasattr(self, "_body"):
             body = await super().body()
@@ -26,7 +26,6 @@ class GzipRequest(Request):
 
 
 class GzipRoute(APIRoute):
-
     def get_route_handler(self) -> Callable:
         original_route_handler = super().get_route_handler()
 
@@ -46,9 +45,29 @@ async def verify_server_enabled():
     return True
 
 
-cookie_router = APIRouter(route_class=GzipRoute,
-                          tags=["servcookie"],
-                          dependencies=[Depends(verify_server_enabled)])
+async def verify_update_auth(
+    x_cookiecloud_auth: Annotated[
+        Optional[str], Header(alias="X-CookieCloud-Auth")
+    ] = None,
+):
+    """
+    校验CookieCloud上传接口的可选共享认证头。
+    """
+    expected_header = (settings.COOKIECLOUD_AUTH_HEADER or "").strip()
+    if not expected_header:
+        return True
+
+    provided_header = (x_cookiecloud_auth or "").strip()
+    if not hmac.compare_digest(provided_header, expected_header):
+        raise HTTPException(status_code=403, detail="CookieCloud认证失败")
+    return True
+
+
+cookie_router = APIRouter(
+    route_class=GzipRoute,
+    tags=["servcookie"],
+    dependencies=[Depends(verify_server_enabled)],
+)
 
 
 @cookie_router.get("/", response_class=PlainTextResponse)
@@ -61,7 +80,7 @@ async def post_root():
     return "Hello MoviePilot! COOKIECLOUD API ROOT = /cookiecloud"
 
 
-@cookie_router.post("/update")
+@cookie_router.post("/update", dependencies=[Depends(verify_update_auth)])
 async def update_cookie(req: schemas.CookieData):
     """
     上传Cookie数据
@@ -70,7 +89,7 @@ async def update_cookie(req: schemas.CookieData):
     content = json.dumps({"encrypted": req.encrypted})
     async with aiofiles.open(file_path, encoding="utf-8", mode="w") as file:
         await file.write(content)
-    async with aiofiles.open(file_path, encoding="utf-8", mode="r") as file:
+    async with aiofiles.open(file_path, encoding="utf-8", errors="replace", mode="r") as file:
         read_content = await file.read()
     if read_content == content:
         return {"action": "done"}
@@ -89,14 +108,15 @@ async def load_encrypt_data(uuid: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Item not found")
 
     # 读取文件
-    async with aiofiles.open(file_path, encoding="utf-8", mode="r") as file:
+    async with aiofiles.open(file_path, encoding="utf-8", errors="replace", mode="r") as file:
         read_content = await file.read()
     data = json.loads(read_content.encode("utf-8"))
     return data
 
 
-def get_decrypted_cookie_data(uuid: str, password: str,
-                              encrypted: str) -> Optional[Dict[str, Any]]:
+def get_decrypted_cookie_data(
+    uuid: str, password: str, encrypted: str
+) -> Optional[Dict[str, Any]]:
     """
     加载本地加密数据并解密为Cookie
     """
@@ -118,7 +138,8 @@ def get_decrypted_cookie_data(uuid: str, password: str,
 
 @cookie_router.get("/get/{uuid}")
 async def get_cookie(
-        uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")]):
+    uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
+):
     """
     GET 下载加密数据
     """
@@ -127,8 +148,9 @@ async def get_cookie(
 
 @cookie_router.post("/get/{uuid}")
 async def post_cookie(
-        uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
-        request: Optional[schemas.CookiePassword] = Body(None)):
+    uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
+    request: Optional[schemas.CookiePassword] = Body(None),
+):
     """
     POST 下载加密数据
     """

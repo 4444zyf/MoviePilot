@@ -1,4 +1,6 @@
+import inspect
 import sys
+from typing import Callable
 
 from app.helper.redis import RedisHelper, AsyncRedisHelper
 
@@ -21,7 +23,7 @@ from app.helper.display import DisplayHelper
 from app.helper.doh import DohHelper
 from app.helper.resource import ResourceHelper
 from app.helper.message import MessageHelper, stop_message
-from app.helper.subscribe import SubscribeHelper
+from app.helper.server import MoviePilotServerHelper
 from app.db import close_database
 from app.db.systemconfig_oper import SystemConfigOper
 from app.command import CommandChain
@@ -73,6 +75,24 @@ def clear_temp():
     SystemUtils.clear(settings.TEMP_PATH, days=settings.TEMP_FILE_DAYS)
     # 清理图片缓存目录中7天前的文件
     SystemUtils.clear(settings.CACHE_PATH / "images", days=settings.GLOBAL_IMAGE_CACHE_DAYS)
+    # 清理 pip/uv 包下载缓存，不接管整个 .cache 目录。
+    clear_package_tool_cache()
+
+
+def clear_package_tool_cache():
+    """
+    清理 pip/uv 包下载缓存，只处理 MoviePilot 管理的工具子目录。
+    """
+    days = settings.PACKAGE_CACHE_DAYS
+    if days <= 0:
+        return
+    tool_cache_root = settings.PACKAGE_CACHE_PATH
+    for child in ("pip", "uv"):
+        cache_path = tool_cache_root / child
+        try:
+            SystemUtils.clear(cache_path, days=days)
+        except Exception as err:
+            logger.warning("清理包下载缓存失败：%s - %s", cache_path, err)
 
 
 def user_auth():
@@ -111,27 +131,27 @@ async def stop_modules():
     """
     服务关闭
     """
-    # 停止AI智能体
-    await stop_agent()
-    # 停止模块
-    ModuleManager().stop()
-    # 停止事件消费
-    EventManager().stop()
-    # 停止虚拟显示
-    DisplayHelper().stop()
-    # 停止线程池
-    ThreadHelper().shutdown()
-    # 停止消息服务
-    stop_message()
-    # 关闭Redis缓存连接
-    RedisHelper().close()
-    await AsyncRedisHelper().close()
-    # 停止数据库连接
-    await close_database()
-    # 停止前端服务
-    stop_frontend()
-    # 清理临时文件
-    clear_temp()
+    async def run_step(name: str, callback: Callable[[], object]) -> None:
+        """单个模块资源关闭失败时继续执行后续阶段"""
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as err:
+            logger.error(f"关闭{name}失败：{err}")
+
+    await run_step("AI智能体", stop_agent)
+    await run_step("模块", lambda: ModuleManager().stop())
+    await run_step("事件消费", lambda: EventManager().stop())
+    await run_step("虚拟显示", lambda: DisplayHelper().stop())
+    await run_step("DoH服务", lambda: DohHelper().shutdown())
+    await run_step("线程池", lambda: ThreadHelper().shutdown())
+    await run_step("消息服务", stop_message)
+    await run_step("Redis缓存连接", lambda: RedisHelper().close())
+    await run_step("异步Redis缓存连接", lambda: AsyncRedisHelper().close())
+    await run_step("数据库连接", close_database)
+    await run_step("前端服务", stop_frontend)
+    await run_step("临时文件", clear_temp)
 
 
 def init_modules():
@@ -152,8 +172,11 @@ def init_modules():
     ModuleManager()
     # 启动事件消费
     EventManager().start()
-    # 初始化订阅分享
-    SubscribeHelper()
+    # 初始化共享服务端状态
+    MoviePilotServerHelper.init_plugin_report()
+    MoviePilotServerHelper.init_subscribe_report()
+    MoviePilotServerHelper.get_user_uuid()
+    MoviePilotServerHelper.get_github_user()
     # 初始化AI智能体
     init_agent()
     # 启动前端服务

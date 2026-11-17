@@ -114,7 +114,6 @@ class TheTvDbModule(_ModuleBase):
         return 4
 
     def stop(self):
-        logger.info("TheTvDbModule 停止。正在清除 TVDB 会话。")
         with self.__auth_lock:
             self.tvdb = None
 
@@ -162,3 +161,12 @@ class TheTvDbModule(_ModuleBase):
         except Exception as err:
             logger.error(f"用标题搜索TVDB剧集失败 ({title}): {str(err)}")
             return []
+
+    def clear_cache(self):
+        """
+        清除缓存
+        """
+        logger.info(f"开始清除{self.get_name()}缓存 ...")
+        if tvdb := self.tvdb:
+            tvdb.clear_cache()
+        logger.info(f"{self.get_name()}缓存清除完成")

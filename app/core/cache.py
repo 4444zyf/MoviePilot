@@ -13,7 +13,7 @@ import aiofiles
 import aioshutil
 from anyio import Path as AsyncPath
 from cachetools import LRUCache as MemoryLRUCache
-from cachetools import TTLCache as MemoryTTLCache
+from cachetools import TLRUCache as MemoryTLRUCache
 from cachetools.keys import hashkey
 
 from app.core.config import settings
@@ -26,8 +26,6 @@ DEFAULT_CACHE_REGION = "DEFAULT"
 DEFAULT_CACHE_SIZE = 1024
 # 默认缓存有效期
 DEFAULT_CACHE_TTL = 365 * 24 * 60 * 60
-
-lock = threading.Lock()
 
 # 上下文变量来控制缓存行为
 _fresh = contextvars.ContextVar('fresh', default=False)
@@ -213,7 +211,7 @@ class CacheBackend(ABC):
         """
         获取缓存的区
         """
-        return f"region:{region}" if region else "region:default"
+        return f"region:{region}" if region else "region:DEFAULT"
 
     @staticmethod
     def is_redis() -> bool:
@@ -297,14 +295,14 @@ class AsyncCacheBackend(CacheBackend):
         """
         获取所有缓存键，类似 dict.keys()（异步）
         """
-        async for key, _ in await self.items(region=region):
+        async for key, _ in self.items(region=region):
             yield key
 
     async def values(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> AsyncGenerator[Any, None]:
         """
         获取所有缓存值，类似 dict.values()（异步）
         """
-        async for _, value in await self.items(region=region):
+        async for _, value in self.items(region=region):
             yield value
 
     async def update(self, other: Dict[str, Any], region: Optional[str] = DEFAULT_CACHE_REGION,
@@ -332,7 +330,7 @@ class AsyncCacheBackend(CacheBackend):
         弹出最后一个缓存项，类似 dict.popitem()（异步）
         """
         items = []
-        async for item in await self.items(region=region):
+        async for item in self.items(region=region):
             items.append(item)
         if not items:
             raise KeyError("popitem(): cache is empty")
@@ -359,10 +357,52 @@ class AsyncCacheBackend(CacheBackend):
         pass
 
 
+class _MemoryTLRUCache(MemoryTLRUCache):
+    """
+    支持为每个 key 设置独立 TTL 的内存缓存
+    """
+
+    def __init__(self, maxsize: int, ttl: int):
+        self.__ttl = ttl
+        self.__setting_ttls: Dict[str, int] = {}
+        super().__init__(maxsize=maxsize, ttu=self._get_expiration)
+
+    def _get_expiration(self, key: str, _value: Any, now: float) -> float:
+        return now + self.__setting_ttls.get(key, self.__ttl)
+
+    @property
+    def ttl(self) -> int:
+        """
+        默认缓存存活时间，单位秒
+        """
+        return self.__ttl
+
+    def set(self, key: str, value: Any, ttl: int) -> None:
+        """
+        使用指定 TTL 设置缓存值
+        """
+        if ttl <= 0:
+            try:
+                del self[key]
+            except KeyError:
+                pass
+            return
+        self.__setting_ttls[key] = ttl
+        try:
+            super().__setitem__(key, value)
+        finally:
+            self.__setting_ttls.pop(key, None)
+
+
 class MemoryBackend(CacheBackend):
     """
-    基于 `cachetools.TTLCache` 实现的缓存后端
+    基于 `cachetools.TLRUCache` 实现的缓存后端
     """
+
+    # 类变量 _region_caches 的互斥锁
+    _lock = threading.Lock()
+    # 存储各个 region 的缓存实例，region -> TLRUCache/LRUCache
+    _region_caches: Dict[str, Union[_MemoryTLRUCache, MemoryLRUCache]] = {}
 
     def __init__(self, cache_type: Literal['ttl', 'lru'] = 'ttl',
                  maxsize: Optional[int] = None, ttl: Optional[int] = None):
@@ -375,11 +415,9 @@ class MemoryBackend(CacheBackend):
         """
         self.cache_type = cache_type
         self.maxsize = maxsize or DEFAULT_CACHE_SIZE
-        self.ttl = ttl or DEFAULT_CACHE_TTL
-        # 存储各个 region 的缓存实例，region -> TTLCache
-        self._region_caches: Dict[str, Union[MemoryTTLCache, MemoryLRUCache]] = {}
+        self.ttl = DEFAULT_CACHE_TTL if ttl is None else ttl
 
-    def __get_region_cache(self, region: str) -> Optional[Union[MemoryTTLCache, MemoryLRUCache]]:
+    def __get_region_cache(self, region: str) -> Optional[Union[_MemoryTLRUCache, MemoryLRUCache]]:
         """
         获取指定区域的缓存实例，如果不存在则返回 None
         """
@@ -393,21 +431,29 @@ class MemoryBackend(CacheBackend):
 
         :param key: 缓存的键
         :param value: 缓存的值
-        :param ttl: 缓存的存活时间，不传入为永久缓存，单位秒
+        :param ttl: 缓存的存活时间，未传入则使用 backend 默认值，单位秒
         :param region: 缓存的区
         """
-        ttl = ttl or self.ttl
-        maxsize = kwargs.get("maxsize", self.maxsize)
+        ttl = self.ttl if ttl is None else ttl
+        maxsize = kwargs.get("maxsize") or self.maxsize
         region = self.get_region(region)
         # 设置缓存值
-        with lock:
-            # 如果该 key 尚未有缓存实例，则创建一个新的 TTLCache 实例
-            region_cache = self._region_caches.setdefault(
-                region,
-                MemoryTTLCache(maxsize=maxsize, ttl=ttl) if self.cache_type == 'ttl'
-                else MemoryLRUCache(maxsize=maxsize)
-            )
-            region_cache[key] = value
+        with self._lock:
+            region_cache = self._region_caches.get(region)
+            if region_cache is None:
+                region_cache = (
+                    _MemoryTLRUCache(maxsize=maxsize, ttl=ttl) if self.cache_type == 'ttl'
+                    else MemoryLRUCache(maxsize=maxsize)
+                )
+                self._region_caches[region] = region_cache
+            elif isinstance(region_cache, _MemoryTLRUCache) != (self.cache_type == 'ttl'):
+                raise ValueError(
+                    f"Cache region {region!r} already uses a different cache type"
+                )
+            if isinstance(region_cache, _MemoryTLRUCache):
+                region_cache.set(key, value, ttl=ttl)
+            else:
+                region_cache[key] = value
 
     def exists(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> bool:
         """
@@ -420,7 +466,8 @@ class MemoryBackend(CacheBackend):
         region_cache = self.__get_region_cache(region)
         if region_cache is None:
             return False
-        return key in region_cache
+        with self._lock:
+            return key in region_cache
 
     def get(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> Any:
         """
@@ -433,7 +480,8 @@ class MemoryBackend(CacheBackend):
         region_cache = self.__get_region_cache(region)
         if region_cache is None:
             return None
-        return region_cache.get(key)
+        with self._lock:
+            return region_cache.get(key)
 
     def delete(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION):
         """
@@ -445,8 +493,9 @@ class MemoryBackend(CacheBackend):
         region_cache = self.__get_region_cache(region)
         if region_cache is None:
             return
-        with lock:
-            del region_cache[key]
+        with self._lock:
+            if key in region_cache:
+                del region_cache[key]
 
     def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -454,19 +503,18 @@ class MemoryBackend(CacheBackend):
 
         :param region: 缓存的区，为None时清空所有区缓存
         """
-        if region:
-            # 清理指定缓存区
-            region_cache = self.__get_region_cache(region)
-            if region_cache:
-                with lock:
+        with self._lock:
+            if region:
+                # 清理指定缓存区
+                region_cache = self.__get_region_cache(region)
+                if region_cache is not None:
                     region_cache.clear()
-                logger.debug(f"Cleared cache for region: {region}")
-        else:
-            # 清除所有区域的缓存
-            for region_cache in self._region_caches.values():
-                with lock:
+                    logger.debug(f"Cleared cache for region: {region}")
+            else:
+                # 清除所有区域的缓存
+                for region_cache in self._region_caches.values():
                     region_cache.clear()
-            logger.info("Cleared all cache")
+                logger.info("Cleared all cache")
 
     def items(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> Generator[Tuple[str, Any], None, None]:
         """
@@ -480,7 +528,7 @@ class MemoryBackend(CacheBackend):
             yield from ()
             return
         # 使用锁保护迭代过程，避免在迭代时缓存被修改
-        with lock:
+        with self._lock:
             # 创建快照避免并发修改问题
             items_snapshot = list(region_cache.items())
         for item in items_snapshot:
@@ -507,18 +555,7 @@ class AsyncMemoryBackend(AsyncCacheBackend):
         :param maxsize: 缓存的最大条目数
         :param ttl: 默认缓存存活时间，单位秒
         """
-        self.cache_type = cache_type
-        self.maxsize = maxsize or DEFAULT_CACHE_SIZE
-        self.ttl = ttl or DEFAULT_CACHE_TTL
-        # 存储各个 region 的缓存实例，region -> TTLCache
-        self._region_caches: Dict[str, Union[MemoryTTLCache, MemoryLRUCache]] = {}
-
-    def __get_region_cache(self, region: str) -> Optional[Union[MemoryTTLCache, MemoryLRUCache]]:
-        """
-        获取指定区域的缓存实例，如果不存在则返回 None
-        """
-        region = self.get_region(region)
-        return self._region_caches.get(region)
+        self._backend = MemoryBackend(cache_type=cache_type, maxsize=maxsize, ttl=ttl)
 
     async def set(self, key: str, value: Any, ttl: Optional[int] = None,
                   region: Optional[str] = DEFAULT_CACHE_REGION, **kwargs) -> None:
@@ -527,21 +564,10 @@ class AsyncMemoryBackend(AsyncCacheBackend):
 
         :param key: 缓存的键
         :param value: 缓存的值
-        :param ttl: 缓存的存活时间，不传入为永久缓存，单位秒
+        :param ttl: 缓存的存活时间，未传入则使用 backend 默认值，单位秒
         :param region: 缓存的区
         """
-        ttl = ttl or self.ttl
-        maxsize = kwargs.get("maxsize", self.maxsize)
-        region = self.get_region(region)
-        # 设置缓存值
-        with lock:
-            # 如果该 key 尚未有缓存实例，则创建一个新的 TTLCache 实例
-            region_cache = self._region_caches.setdefault(
-                region,
-                MemoryTTLCache(maxsize=maxsize, ttl=ttl) if self.cache_type == 'ttl'
-                else MemoryLRUCache(maxsize=maxsize)
-            )
-            region_cache[key] = value
+        return self._backend.set(key=key, value=value, ttl=ttl, region=region, **kwargs)
 
     async def exists(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> bool:
         """
@@ -551,10 +577,7 @@ class AsyncMemoryBackend(AsyncCacheBackend):
         :param region: 缓存的区
         :return: 存在返回 True，否则返回 False
         """
-        region_cache = self.__get_region_cache(region)
-        if region_cache is None:
-            return False
-        return key in region_cache
+        return self._backend.exists(key=key, region=region)
 
     async def get(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> Any:
         """
@@ -564,10 +587,7 @@ class AsyncMemoryBackend(AsyncCacheBackend):
         :param region: 缓存的区
         :return: 返回缓存的值，如果缓存不存在返回 None
         """
-        region_cache = self.__get_region_cache(region)
-        if region_cache is None:
-            return None
-        return region_cache.get(key)
+        return self._backend.get(key=key, region=region)
 
     async def delete(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION):
         """
@@ -576,11 +596,7 @@ class AsyncMemoryBackend(AsyncCacheBackend):
         :param key: 缓存的键
         :param region: 缓存的区
         """
-        region_cache = self.__get_region_cache(region)
-        if region_cache is None:
-            return
-        with lock:
-            del region_cache[key]
+        return self._backend.delete(key=key, region=region)
 
     async def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -588,19 +604,7 @@ class AsyncMemoryBackend(AsyncCacheBackend):
 
         :param region: 缓存的区，为None时清空所有区缓存
         """
-        if region:
-            # 清理指定缓存区
-            region_cache = self.__get_region_cache(region)
-            if region_cache:
-                with lock:
-                    region_cache.clear()
-                logger.debug(f"Cleared cache for region: {region}")
-        else:
-            # 清除所有区域的缓存
-            for region_cache in self._region_caches.values():
-                with lock:
-                    region_cache.clear()
-            logger.info("All cache cleared！")
+        return self._backend.clear(region=region)
 
     async def items(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> AsyncGenerator[Tuple[str, Any], None]:
         """
@@ -609,14 +613,7 @@ class AsyncMemoryBackend(AsyncCacheBackend):
         :param region: 缓存的区
         :return: 返回一个字典，包含所有缓存键值对
         """
-        region_cache = self.__get_region_cache(region)
-        if region_cache is None:
-            return
-        # 使用锁保护迭代过程，避免在迭代时缓存被修改
-        with lock:
-            # 创建快照避免并发修改问题
-            items_snapshot = list(region_cache.items())
-        for item in items_snapshot:
+        for item in self._backend.items(region):
             yield item
 
     async def close(self) -> None:
@@ -647,11 +644,14 @@ class RedisBackend(CacheBackend):
 
         :param key: 缓存的键
         :param value: 缓存的值
-        :param ttl: 缓存的存活时间，未传入则为永久缓存，单位秒
+        :param ttl: 缓存的存活时间，未传入则使用 backend 默认值，单位秒
         :param region: 缓存的区
         :param kwargs: kwargs
         """
-        ttl = ttl or self.ttl
+        ttl = self.ttl if ttl is None else ttl
+        if ttl is not None and ttl <= 0:
+            self.redis_helper.delete(key, region=region)
+            return
         self.redis_helper.set(key, value, ttl=ttl, region=region, **kwargs)
 
     def exists(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> bool:
@@ -728,11 +728,14 @@ class AsyncRedisBackend(AsyncCacheBackend):
 
         :param key: 缓存的键
         :param value: 缓存的值
-        :param ttl: 缓存的存活时间，未传入则为永久缓存，单位秒
+        :param ttl: 缓存的存活时间，未传入则使用 backend 默认值，单位秒
         :param region: 缓存的区
         :param kwargs: kwargs
         """
-        ttl = ttl or self.ttl
+        ttl = self.ttl if ttl is None else ttl
+        if ttl is not None and ttl <= 0:
+            await self.redis_helper.delete(key, region=region)
+            return
         await self.redis_helper.set(key, value, ttl=ttl, region=region, **kwargs)
 
     async def exists(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> bool:
@@ -853,8 +856,10 @@ class FileBackend(CacheBackend):
         :param region: 缓存的区
         """
         cache_path = self.base / region / key
-        if cache_path.exists():
+        if cache_path.is_file():
             cache_path.unlink()
+        elif cache_path.exists():
+            shutil.rmtree(cache_path, ignore_errors=True)
 
     def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -890,10 +895,11 @@ class FileBackend(CacheBackend):
         if not cache_path.exists():
             yield from ()
             return
-        for item in cache_path.iterdir():
+        for item in sorted(cache_path.rglob("*")):
             if item.is_file():
-                with open(item, 'r') as f:
-                    yield item.as_posix(), f.read()
+                key = item.relative_to(cache_path).as_posix()
+                with open(item, 'rb') as f:
+                    yield key, f.read()
 
     def close(self) -> None:
         """
@@ -966,8 +972,10 @@ class AsyncFileBackend(AsyncCacheBackend):
         :param region: 缓存的区
         """
         cache_path = AsyncPath(self.base) / region / key
-        if await cache_path.exists():
+        if await cache_path.is_file():
             await cache_path.unlink()
+        elif await cache_path.exists():
+            await aioshutil.rmtree(cache_path, ignore_errors=True)
 
     async def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -1001,12 +1009,12 @@ class AsyncFileBackend(AsyncCacheBackend):
         """
         cache_path = AsyncPath(self.base) / region
         if not await cache_path.exists():
-            yield "", None
             return
-        async for item in cache_path.iterdir():
+        async for item in cache_path.rglob("*"):
             if await item.is_file():
-                async with aiofiles.open(item, 'r') as f:
-                    yield item.as_posix(), await f.read()
+                key = Path(str(item)).relative_to(Path(str(cache_path))).as_posix()
+                async with aiofiles.open(item, 'rb') as f:
+                    yield key, await f.read()
 
     async def close(self) -> None:
         """
@@ -1060,7 +1068,7 @@ def FileCache(base: Path = settings.TEMP_PATH, ttl: Optional[int] = None) -> Cac
     """
     if settings.CACHE_BACKEND_TYPE == "redis":
         # 如果使用 Redis，则设置缓存的存活时间为配置的天数转换为秒
-        return RedisBackend(ttl=ttl or settings.TEMP_FILE_DAYS * 24 * 3600)
+        return RedisBackend(ttl=ttl if ttl is not None else settings.TEMP_FILE_DAYS * 24 * 3600)
     else:
         # 如果使用文件系统，在停止服务时会自动清理过期文件
         return FileBackend(base=base)
@@ -1072,7 +1080,7 @@ def AsyncFileCache(base: Path = settings.TEMP_PATH, ttl: Optional[int] = None) -
     """
     if settings.CACHE_BACKEND_TYPE == "redis":
         # 如果使用 Redis，则设置缓存的存活时间为配置的天数转换为秒
-        return AsyncRedisBackend(ttl=ttl or settings.TEMP_FILE_DAYS * 24 * 3600)
+        return AsyncRedisBackend(ttl=ttl if ttl is not None else settings.TEMP_FILE_DAYS * 24 * 3600)
     else:
         # 如果使用文件系统，在停止服务时会自动清理过期文件
         return AsyncFileBackend(base=base)
@@ -1115,19 +1123,28 @@ def AsyncCache(cache_type: Literal['ttl', 'lru'] = 'ttl',
 
 
 def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Optional[int] = None,
-           skip_none: Optional[bool] = True, skip_empty: Optional[bool] = False):
+           skip_none: Optional[bool] = True, skip_empty: Optional[bool] = False, shared_key: Optional[str] = None):
     """
-    自定义缓存装饰器，支持为每个 key 动态传递 maxsize 和 ttl
+    自定义缓存装饰器，支持配置缓存区域的 maxsize 和每个 key 的 ttl
 
-    :param region: 缓存的区
-    :param maxsize: 缓存的最大条目数
-    :param ttl: 缓存的存活时间，单位秒，未传入则为永久缓存，单位秒
+    :param region: 缓存区域的标识符，默认根据模块名、函数名等自动生成标识
+    :param maxsize: 缓存区内的最大条目数
+    :param ttl: 缓存的存活时间，单位秒；未传入时使用 LRU 缓存
     :param skip_none: 跳过 None 缓存，默认为 True
     :param skip_empty: 跳过空值缓存（如 None, [], {}, "", set()），默认为 False
+    :param shared_key: 同步/异步函数共享缓存的键，默认使用函数名（异步函数名会标准化为同步格式，如移除 `async_` 前缀）
     :return: 装饰器函数
     """
 
     def decorator(func):
+        # 函数签名在装饰后不会变化，预计算可避免每次缓存访问都重复反射。
+        signature = inspect.signature(func)
+        parameter_names = list(signature.parameters.keys())
+        cache_parameter_names = (
+            parameter_names[1:]
+            if parameter_names and parameter_names[0] in ("self", "cls")
+            else parameter_names
+        )
 
         def should_cache(value: Any) -> bool:
             """
@@ -1173,6 +1190,17 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
                     return False
             return True
 
+        def __standardize_func_name() -> str:
+            """
+            将异步函数名标准化为同步函数的命名，以生成统一的缓存键
+            """
+            # XXX 假设异步函数名与同步版本仅差`async_`前缀或`_async`后缀（当前MP代码大多符合），否则需通过`shared_key`参数显式指定
+            return (
+                func.__name__.removeprefix("async_").removesuffix("_async")
+                if is_async
+                else func.__name__
+            )
+
         def __get_cache_key(args, kwargs) -> str:
             """
             根据函数和参数生成缓存键
@@ -1181,30 +1209,34 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
             :param kwargs: 关键字参数
             :return: 缓存键
             """
-            signature = inspect.signature(func)
             # 绑定传入的参数并应用默认值
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
-            # 忽略第一个参数，如果它是实例(self)或类(cls)
-            parameters = list(signature.parameters.keys())
-            if parameters and parameters[0] in ("self", "cls"):
-                bound.arguments.pop(parameters[0], None)
             # 按照函数签名顺序提取参数值列表
             keys = [
-                bound.arguments[param] for param in signature.parameters if param in bound.arguments
+                bound.arguments[param] for param in cache_parameter_names if param in bound.arguments
             ]
             # 使用有序参数生成缓存键
-            return f"{func.__name__}_{hashkey(*keys)}"
+            return f"{func_name}_{hashkey(*keys)}"
 
-        # 获取缓存区
-        cache_region = region if region is not None else f"{func.__module__}.{func.__name__}"
-
+        # 被装饰函数的上层名称（如类名或外层函数名）
+        enclosing_name = (
+            func.__qualname__[:last_dot]
+            if (last_dot := func.__qualname__.rfind(".")) != -1
+            else ""
+        )
         # 检查是否为异步函数
         is_async = inspect.iscoroutinefunction(func)
+        # 生成标准化后的函数名称，用于同步/异步函数共享缓存
+        func_name = shared_key if shared_key else __standardize_func_name()
+        # 获取缓存区
+        cache_region = (
+            region if region is not None else f"{func.__module__}:{enclosing_name}:{func_name}"
+        )
 
         if is_async:
             # 异步函数使用异步缓存后端
-            cache_backend = AsyncCache(cache_type="ttl" if ttl else "lru", maxsize=maxsize, ttl=ttl)
+            cache_backend = AsyncCache(cache_type="ttl" if ttl is not None else "lru", maxsize=maxsize, ttl=ttl)
             # 异步函数的缓存装饰器
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
@@ -1232,12 +1264,31 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
                 """
                 await cache_backend.clear(region=cache_region)
 
+            async def cache_exists(*args, **kwargs) -> bool:
+                """
+                判断当前参数对应的有效缓存是否存在。
+                """
+                cache_key = __get_cache_key(args, kwargs)
+                cached_value = await cache_backend.get(cache_key, region=cache_region)
+                return should_cache(cached_value) and await async_is_valid_cache_value(
+                    cache_key, cached_value, cache_region
+                )
+
+            async def cache_delete(*args, **kwargs) -> None:
+                """
+                删除当前参数对应的缓存。
+                """
+                cache_key = __get_cache_key(args, kwargs)
+                await cache_backend.delete(cache_key, region=cache_region)
+
             async_wrapper.cache_region = cache_region
             async_wrapper.cache_clear = cache_clear
+            async_wrapper.cache_exists = cache_exists
+            async_wrapper.cache_delete = cache_delete
             return async_wrapper
         else:
             # 同步函数使用同步缓存后端
-            cache_backend = Cache(cache_type="ttl" if ttl else "lru", maxsize=maxsize, ttl=ttl)
+            cache_backend = Cache(cache_type="ttl" if ttl is not None else "lru", maxsize=maxsize, ttl=ttl)
             # 同步函数的缓存装饰器
             @wraps(func)
             def wrapper(*args, **kwargs):
@@ -1264,8 +1315,27 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
                 """
                 cache_backend.clear(region=cache_region)
 
+            def cache_exists(*args, **kwargs) -> bool:
+                """
+                判断当前参数对应的有效缓存是否存在。
+                """
+                cache_key = __get_cache_key(args, kwargs)
+                cached_value = cache_backend.get(cache_key, region=cache_region)
+                return should_cache(cached_value) and is_valid_cache_value(
+                    cache_key, cached_value, cache_region
+                )
+
+            def cache_delete(*args, **kwargs) -> None:
+                """
+                删除当前参数对应的缓存。
+                """
+                cache_key = __get_cache_key(args, kwargs)
+                cache_backend.delete(cache_key, region=cache_region)
+
             wrapper.cache_region = cache_region
             wrapper.cache_clear = cache_clear
+            wrapper.cache_exists = cache_exists
+            wrapper.cache_delete = cache_delete
             return wrapper
 
     return decorator

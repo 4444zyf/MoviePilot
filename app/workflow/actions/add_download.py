@@ -26,6 +26,12 @@ class AddDownloadAction(BaseAction):
     添加下载资源
     """
 
+    contract = {
+        "inputs": [{"name": "torrents", "label": "资源", "kind": "list"}],
+        "outputs": [{"name": "downloads", "label": "下载任务", "kind": "list"}],
+        "concurrency_key": "download",
+    }
+
     def __init__(self, action_id: str):
         super().__init__(action_id)
         self._added_downloads = []
@@ -67,7 +73,10 @@ class AddDownloadAction(BaseAction):
             if not t.meta_info:
                 t.meta_info = MetaInfo(title=t.torrent_info.title, subtitle=t.torrent_info.description)
             if not t.media_info:
-                t.media_info = MediaChain().recognize_media(meta=t.meta_info)
+                t.media_info = MediaChain().recognize_by_meta(
+                    t.meta_info,
+                    obtain_images=False,
+                )
             if not t.media_info:
                 self._has_error = True
                 logger.warning(f"{t.torrent_info.title} 未识别到媒体信息，无法下载")

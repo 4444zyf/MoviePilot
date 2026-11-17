@@ -61,6 +61,12 @@ class StorageChain(ChainBase):
         """
         return self.run_module("create_folder", fileitem=fileitem, name=name)
 
+    def get_folder(self, storage: str, path: Path) -> Optional[schemas.FileItem]:
+        """
+        获取目录，不存在则递归创建
+        """
+        return self.run_module("get_folder", storage=storage, path=path)
+
     def download_file(self, fileitem: schemas.FileItem, path: Path = None) -> Optional[Path]:
         """
         下载文件
@@ -156,7 +162,7 @@ class StorageChain(ChainBase):
         """
         判断是否包含蓝光必备的文件夹
         """
-        required_files = ("BDMV", "CERTIFICATE")
+        required_files = {"BDMV", "CERTIFICATE"}
         return any(
             item.type == "dir" and item.name in required_files
             for item in fileitems or []
@@ -166,7 +172,7 @@ class StorageChain(ChainBase):
         """
         删除媒体文件，以及不含媒体文件的目录
         """
-        media_exts = settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT
+        media_exts = settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
         fileitem_path = Path(fileitem.path) if fileitem.path else Path("")
         if len(fileitem_path.parts) <= 2:
             logger.warn(f"【{fileitem.storage}】{fileitem.path} 根目录或一级目录不允许删除")

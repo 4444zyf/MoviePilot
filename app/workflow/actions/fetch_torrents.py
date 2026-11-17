@@ -5,6 +5,7 @@ from typing import Optional, List
 from pydantic import Field
 
 from app.workflow.actions import BaseAction
+from app.chain.media import MediaChain
 from app.chain.search import SearchChain
 from app.core.config import global_vars
 from app.log import logger
@@ -28,6 +29,11 @@ class FetchTorrentsAction(BaseAction):
     """
     搜索站点资源
     """
+
+    contract = {
+        "inputs": [{"name": "medias", "label": "媒体", "kind": "list"}],
+        "outputs": [{"name": "torrents", "label": "资源", "kind": "list"}],
+    }
 
     def __init__(self, action_id: str):
         super().__init__(action_id)
@@ -68,11 +74,14 @@ class FetchTorrentsAction(BaseAction):
                     continue
                 if params.type and torrent.media_info and torrent.media_info.type != MediaType(params.type):
                     continue
-                if params.season and torrent.meta_info.begin_season != params.season:
+                if params.season is not None and torrent.meta_info.begin_season != params.season:
                     continue
                 # 识别媒体信息
                 if params.match_media:
-                    torrent.media_info = searchchain.recognize_media(torrent.meta_info)
+                    torrent.media_info = MediaChain().recognize_by_meta(
+                        torrent.meta_info,
+                        obtain_images=False,
+                    )
                     if not torrent.media_info:
                         logger.warning(f"{torrent.torrent_info.title} 未识别到媒体信息")
                         continue
@@ -84,6 +93,10 @@ class FetchTorrentsAction(BaseAction):
                     break
                 torrents = searchchain.search_by_id(tmdbid=media.tmdb_id,
                                                     doubanid=media.douban_id,
+                                                    bangumiid=media.bangumi_id,
+                                                    anilistid=media.anilist_id,
+                                                    source=media.source,
+                                                    mediaid=media.media_id,
                                                     mtype=MediaType(media.type),
                                                     sites=params.sites)
                 for torrent in torrents:

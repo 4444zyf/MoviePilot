@@ -19,6 +19,11 @@ class AddSubscribeAction(BaseAction):
     添加订阅
     """
 
+    contract = {
+        "inputs": [{"name": "medias", "label": "媒体", "kind": "list"}],
+        "outputs": [{"name": "subscribes", "label": "订阅", "kind": "list"}],
+    }
+
     def __init__(self, action_id: str):
         super().__init__(action_id)
         self._added_subscribes = []
@@ -71,6 +76,9 @@ class AddSubscribeAction(BaseAction):
                                               season=mediainfo.season,
                                               doubanid=mediainfo.douban_id,
                                               bangumiid=mediainfo.bangumi_id,
+                                              anilistid=mediainfo.anilist_id,
+                                              media_source=mediainfo.source,
+                                              media_id=mediainfo.to_dict().get("media_id"),
                                               username=settings.SUPERUSER)
             if sid:
                 self._added_subscribes.append(sid)

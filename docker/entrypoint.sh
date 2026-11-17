@@ -20,6 +20,18 @@ function WARN() {
     echo -e "${WARN} ${1}"
 }
 
+ENTRYPOINT_START_TIME="$(date +%s)"
+
+function normalize_env_value() {
+    printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
+function is_truthy_value() {
+    local value
+    value="$(normalize_env_value "${1:-}")"
+    [ "${value}" = "true" ] || [ "${value}" = "1" ] || [ "${value}" = "yes" ]
+}
+
 # 设置虚拟环境路径（兼容群晖等系统必须这样配置）
 VENV_PATH="${VENV_PATH:-/opt/venv}"
 export PATH="${VENV_PATH}/bin:$PATH"
@@ -27,8 +39,61 @@ export PATH="${VENV_PATH}/bin:$PATH"
 # 校正设置目录
 CONFIG_DIR="${CONFIG_DIR:-/config}"
 
-# 记录非系统环境（docker容器表）提供的变量
-declare -ga VARS_SET_BY_SCRIPT=()
+function apply_package_cache_env() {
+    PACKAGE_CACHE_ROOT="${PACKAGE_CACHE_ROOT:-${CONFIG_DIR}/.cache}"
+    export PACKAGE_CACHE_ROOT
+    export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PACKAGE_CACHE_ROOT}/pip}"
+    export UV_CACHE_DIR="${UV_CACHE_DIR:-${PACKAGE_CACHE_ROOT}/uv}"
+    mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
+}
+
+function run_package_command() {
+    if [ -n "${PROXY_HOST}" ]; then
+        HTTP_PROXY="${PROXY_HOST}" \
+            HTTPS_PROXY="${PROXY_HOST}" \
+            http_proxy="${PROXY_HOST}" \
+            https_proxy="${PROXY_HOST}" \
+            "$@"
+    else
+        "$@"
+    fi
+}
+
+function wait_backend_ready() {
+    local entrypoint_start_time="${1:-$(date +%s)}"
+    local backend_start_time="${2:-$(date +%s)}"
+    local python_pid="${3:-}"
+    local backend_port="${PORT:-3001}"
+    local web_port="${NGINX_PORT:-3000}"
+    local timeout="${MOVIEPILOT_BACKEND_READY_TIMEOUT:-300}"
+    local ready_url="http://127.0.0.1:${backend_port}/api/v1/system/global?token=moviepilot"
+    local deadline
+    if ! [[ "${timeout}" =~ ^[0-9]+$ ]] || [ "$((10#${timeout}))" -le 0 ]; then
+        WARN "→ MOVIEPILOT_BACKEND_READY_TIMEOUT=${timeout} 无效，使用默认 300 秒。"
+        timeout=300
+    else
+        timeout=$((10#${timeout}))
+    fi
+    deadline=$(( $(date +%s) + timeout ))
+
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        if [ -n "${python_pid}" ] && ! kill -0 "${python_pid}" >/dev/null 2>&1; then
+            WARN "→ 后端服务启动完成探测已停止：后端进程已退出。"
+            return 1
+        fi
+
+        if curl -fsS --max-time 2 "${ready_url}" >/dev/null 2>&1; then
+            local now
+            now="$(date +%s)"
+            INFO "→ MoviePilot Web 已可访问，启动总耗时 $(( now - entrypoint_start_time )) 秒，后端就绪耗时 $(( now - backend_start_time )) 秒，后端端口 ${backend_port}，前端端口 ${web_port}。"
+            return 0
+        fi
+        sleep 1
+    done
+
+    WARN "→ 后端服务启动完成探测超时，已等待 ${timeout} 秒，后端端口 ${backend_port}，继续等待进程日志..."
+    return 1
+}
 
 # 环境变量补全
 # 优先级: 系统环境变量 -> .env 文件 (即使为空字符串) -> 预设默认值
@@ -38,31 +103,30 @@ function load_config_from_app_env() {
     local env_file="${CONFIG_DIR}/app.env"
 
     # 定义 ["变量名"]="预设默认值"
-    # 禁止填入 CONFIG_DIR 变量，ACME_ENV_ 开头的变量暂时不处理，还是交由 cert.sh 处理
+    # 禁止填入 CONFIG_DIR 变量，ACME_ENV_ 开头的变量不设默认值，仅透传 app.env 中已有配置。
     declare -A vars_and_default_values=(
         # update.sh
         ["PIP_PROXY"]=""
+        ["PACKAGE_CACHE_ROOT"]=""
         ["GITHUB_PROXY"]=""
         ["PROXY_HOST"]=""
         ["GITHUB_TOKEN"]=""
         ["MOVIEPILOT_AUTO_UPDATE"]="release"
-
-        # database
-        ["DB_TYPE"]="sqlite"
-        ["DB_POSTGRESQL_HOST"]="localhost"
-        ["DB_POSTGRESQL_PORT"]="5432"
-        ["DB_POSTGRESQL_DATABASE"]="moviepilot"
-        ["DB_POSTGRESQL_USERNAME"]="moviepilot"
-        ["DB_POSTGRESQL_PASSWORD"]="moviepilot"
-        ["DB_POSTGRESQL_POOL_SIZE"]="20"
-        ["DB_POSTGRESQL_MAX_OVERFLOW"]="30"
+        ["MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE"]="true"
+        ["MOVIEPILOT_FORCE_CHOWN"]="false"
+        ["MOVIEPILOT_SAFE_MODE"]="false"
+        ["BROWSER_EMULATION"]="cloakbrowser"
 
         # cert
         ["ENABLE_SSL"]="false"
+        ["AUTO_ISSUE_CERT"]="false"
         ["SSL_DOMAIN"]=""
+        ["SSL_EMAIL"]=""
+        ["DNS_PROVIDER"]=""
+        ["SSL_NGINX_PORT"]="443"
         ["NGINX_PORT"]="3000"
         ["PORT"]="3001"
-        ["NGINX_CLIENT_MAX_BODY_SIZE"]="10m"
+        ["NGINX_CLIENT_MAX_BODY_SIZE"]="50m"
     )
 
     INFO "开始加载配置 (配置文件: ${env_file})..."
@@ -82,7 +146,7 @@ function load_config_from_app_env() {
                 key_in_file="${BASH_REMATCH[1]}"
                 value_raw_in_file="${BASH_REMATCH[2]}"
 
-                if [[ -n "${vars_and_default_values[$key_in_file]+_}" ]]; then
+                if [[ -n "${vars_and_default_values[$key_in_file]+_}" || "${key_in_file}" == ACME_ENV_* ]]; then
                     local temp_val_after_initial_trim
                     temp_val_after_initial_trim="${value_raw_in_file#"${value_raw_in_file%%[![:space:]]*}"}"
                     temp_val_after_initial_trim="${temp_val_after_initial_trim%"${temp_val_after_initial_trim##*[![:space:]]}"}"
@@ -119,20 +183,16 @@ function load_config_from_app_env() {
         INFO "${env_file} 文件不存在，跳过文件加载。"
      fi
 
-    INFO "正在根据优先级确定并导出配置值..."
     for var_name in "${!vars_and_default_values[@]}"; do
         local fallback_value="${vars_and_default_values[$var_name]}"
         local final_value
         local value_source="未设置"
-        # 标志变量是否来自初始环境
-        local set_by_initial_env=false
 
         # 检查变量是否在环境中已设置（可能为空）
         if eval "[ -n \"\${${var_name}+x}\" ]"; then
             # 获取其值
             final_value="$(eval echo \"\$"${var_name}"\")"
             value_source="系统环境变量"
-            set_by_initial_env=true
         elif [[ -n "${values_from_env_file["${var_name}"]+_}" ]]; then
             final_value="${values_from_env_file["${var_name}"]}"
             value_source=".env 文件"
@@ -141,31 +201,20 @@ function load_config_from_app_env() {
             value_source="内置默认值"
         fi
 
-        # 不论来源如何，都导出变量，以便脚本的其余部分和子进程使用
-        # (例如 envsubst, mp_update.sh, cert.sh)
-        if declare -gx "${var_name}=${final_value}"; then
-            if [ -z "${final_value}" ]; then
-                 INFO "变量 ${var_name}, 值为空 (来源: ${value_source})。"
-            else
-                 INFO "变量 ${var_name}, 值: ${final_value} (来源: ${value_source})。"
-            fi
+        if ! declare -g "${var_name}=${final_value}"; then
+            ERROR "设置变量 ${var_name}, 值: '${final_value}'失败 (来源: ${value_source}) "
+        fi
+    done
 
-            # 如果变量不是来自初始环境变量，则记录下来以便稍后 unset
-            if ! ${set_by_initial_env}; then
-                # 检查是否已在数组中，避免重复添加
-                local found_in_script_vars=false
-                for item in "${VARS_SET_BY_SCRIPT[@]}"; do
-                    if [[ "$item" == "$var_name" ]]; then
-                        found_in_script_vars=true
-                        break
-                    fi
-                done
-                if ! ${found_in_script_vars}; then
-                    VARS_SET_BY_SCRIPT+=("${var_name}")
-                fi
-            fi
-        else
-            ERROR "导出变量 ${var_name}, 值: '${final_value}'失败 (来源: ${value_source}) "
+    for var_name in "${!values_from_env_file[@]}"; do
+        if [[ "${var_name}" != ACME_ENV_* ]]; then
+            continue
+        fi
+        if eval "[ -n \"\${${var_name}+x}\" ]"; then
+            continue
+        fi
+        if ! declare -g "${var_name}=${values_from_env_file["${var_name}"]}"; then
+            ERROR "设置变量 ${var_name} 失败 (来源: .env 文件) "
         fi
     done
 
@@ -173,12 +222,11 @@ function load_config_from_app_env() {
     INFO "配置加载流程执行完毕。"
 }
 
-# 使用env配置
-load_config_from_app_env
-
-# 生成HTTPS配置块
-if [ "${ENABLE_SSL}" = "true" ]; then
-    export HTTPS_SERVER_CONF=$(cat <<EOF
+# 生成 nginx 配置，仅为 envsubst 单次调用传入模板变量。
+function render_nginx_config() {
+    local https_server_conf
+    if [ "${ENABLE_SSL}" = "true" ]; then
+        https_server_conf=$(cat <<EOF
     server {
         include /etc/nginx/mime.types;
         default_type application/octet-stream;
@@ -203,16 +251,224 @@ if [ "${ENABLE_SSL}" = "true" ]; then
     }
 EOF
 )
-else
-    export HTTPS_SERVER_CONF="# HTTPS未启用"
+        else
+            https_server_conf="# HTTPS未启用"
+        fi
+
+    NGINX_PORT="${NGINX_PORT}" \
+        PORT="${PORT}" \
+        NGINX_CLIENT_MAX_BODY_SIZE="${NGINX_CLIENT_MAX_BODY_SIZE}" \
+        HTTPS_SERVER_CONF="${https_server_conf}" \
+        envsubst '${NGINX_PORT}${PORT}${NGINX_CLIENT_MAX_BODY_SIZE}${HTTPS_SERVER_CONF}' < /etc/nginx/nginx.template.conf > /etc/nginx/nginx.conf
+}
+
+# 优雅退出
+function graceful_exit() {
+    local exit_code=${1:-0}
+    local reason=${2:-python_exit}
+
+    if [ "$reason" = "signal" ]; then
+        INFO "→ 收到停止信号，执行精准清理程序..."
+    elif [ "$reason" = "intentional_restart" ]; then
+        INFO "→ 检测到内置重启流程，执行清理程序..."
+    else
+        INFO "→ 主进程已退出 (代码: $exit_code)，执行清理程序..."
+    fi
+
+    # 第一步：停止前端 Nginx
+    # 默认配置启动的 Nginx，默认 PID 在 /var/run/nginx.pid
+    INFO "→ [1/3] 正在关闭前端 Nginx..."
+    nginx -c /etc/nginx/nginx.conf -s stop 2>/dev/null || true
+
+    # 第二步：等待 Python 退出
+    # 由于使用了 tini -g，Python 已经收到了信号，我们只需等待
+    if [ -n "$PYTHON_PID" ] && ps -p "$PYTHON_PID" > /dev/null; then
+        INFO "→ [2/3] 正在等待 Python (PID: $PYTHON_PID) 完成清理..."
+        # 这里的 wait 会阻塞，直到 Python 真正退出
+        wait "$PYTHON_PID" 2>/dev/null || true
+    fi
+
+    # 第三步：最后关闭 Docker Proxy
+    # 必须指定配置文件路径，否则 nginx -s stop 找不到它
+    INFO "→ [3/3] 后端已安全退出，正在关闭 Docker Proxy..."
+    if [ -S "/var/run/docker.sock" ]; then
+        nginx -c /etc/nginx/docker_http_proxy.conf -s stop 2>/dev/null || true
+    fi
+
+    # 根据退出码判断最终日志性质
+    # 0: 正常退出
+    # 130/143: 被系统信号终止（通常也视为预期的清理退出）
+    if [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 143 ] || [ "$reason" = "intentional_restart" ]; then
+        INFO "→ 所有服务已按序清理，容器正常退出 (ExitCode: $exit_code)。"
+    else
+        # 非预期退出码，使用 ERROR 级别并加重提示
+        ERROR "→ 清理完成，但主进程检测到异常退出 (ExitCode: $exit_code)！"
+    fi
+    exit "$exit_code"
+}
+
+# 后端异常退出时默认保留容器，避免无法 docker exec 进入容器运行 doctor。
+function diagnostic_keepalive() {
+    local exit_code=${1:-1}
+    local keepalive
+    keepalive="$(normalize_env_value "${MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE:-true}")"
+
+    if [ "${keepalive}" = "false" ] || [ "${keepalive}" = "0" ] || [ "${keepalive}" = "no" ]; then
+        graceful_exit "$exit_code" "python_exit"
+    fi
+
+    ERROR "→ 后端主进程异常退出 (ExitCode: ${exit_code})，容器将保持运行以便执行 moviepilot doctor。"
+    WARN "→ 可运行：docker exec <container> moviepilot doctor"
+    WARN "→ 如需恢复旧行为，可设置 MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE=false。"
+
+    if [ "${START_NOGOSU:-false}" = "true" ]; then
+        "${VENV_PATH}/bin/python3" -m app.cli doctor || true
+    else
+        gosu moviepilot:moviepilot "${VENV_PATH}/bin/python3" -m app.cli doctor || true
+    fi
+
+    while true; do
+        sleep 3600 &
+        wait $! || true
+    done
+}
+
+# 启动前先检查后端核心依赖是否仍然可导入。
+# 插件依赖和主程序共用同一套 venv 时，历史安装记录可能已经污染环境，
+# 这里优先在真正拉起后端前做一次自愈，避免容器反复起不来。
+function ensure_backend_runtime_dependencies() {
+    local probe_code="import alembic, cloakbrowser, fastapi, pydantic, pydantic_core, pydantic_settings, sqlalchemy, starlette, uvicorn; from pydantic import BaseModel, Field"
+
+    INFO "→ 启动前检查后端核心依赖..."
+    if "${VENV_PATH}/bin/python3" -c "${probe_code}" >/dev/null 2>&1; then
+        INFO "→ 后端核心依赖检查通过。"
+        return 0
+    fi
+
+    WARN "→ 检测到后端核心依赖异常，开始尝试恢复主程序依赖..."
+    local -a pip_cmd=("${VENV_PATH}/bin/pip" "install" "-r" "/app/requirements.txt")
+    if [ -n "${PIP_PROXY}" ]; then
+        pip_cmd+=("-i" "${PIP_PROXY}")
+    fi
+
+    if ! run_package_command "${pip_cmd[@]}" > /dev/stdout 2> /dev/stderr; then
+        ERROR "→ 自动恢复主程序依赖失败，后端无法启动。"
+        diagnostic_keepalive 1
+    fi
+
+    if ! "${VENV_PATH}/bin/python3" -c "${probe_code}" >/dev/null 2>&1; then
+        ERROR "→ 主程序依赖恢复后仍然异常，后端无法启动。"
+        diagnostic_keepalive 1
+    fi
+
+    INFO "→ 已自动恢复主程序依赖，继续启动后端。"
+}
+
+function path_owner_id() {
+    local target="${1:-}"
+    [ -n "${target}" ] || return 0
+    stat -c '%u:%g' "${target}" 2>/dev/null || stat -f '%u:%g' "${target}" 2>/dev/null || true
+}
+
+function force_chown_image_paths_if_requested() {
+    if ! is_truthy_value "${MOVIEPILOT_FORCE_CHOWN:-false}"; then
+        return 0
+    fi
+
+    WARN "→ MOVIEPILOT_FORCE_CHOWN 已启用，将递归修复 /app、/public 权限，可能显著增加启动耗时。"
+
+    local path
+    for path in "$@"; do
+        [ -e "${path}" ] || continue
+        chown -R moviepilot:moviepilot "${path}"
+    done
+}
+
+function correct_home_permissions() {
+    [ -e "${HOME}" ] || return 0
+
+    chown moviepilot:moviepilot "${HOME}"
+    [ -e "${HOME}/.cloakbrowser" ] && chown -h moviepilot:moviepilot "${HOME}/.cloakbrowser"
+
+    if is_truthy_value "${MOVIEPILOT_FORCE_CHOWN:-false}"; then
+        [ -e "${HOME}/.cloakbrowser" ] && chown -R moviepilot:moviepilot "${HOME}/.cloakbrowser"
+    elif [ -e "${HOME}/.cloakbrowser" ]; then
+        INFO "→ 默认跳过 ${HOME}/.cloakbrowser 递归权限校正，如遇浏览器缓存权限错误可设置 MOVIEPILOT_FORCE_CHOWN=true 后重启一次。"
+    fi
+
+    find "${HOME}" -mindepth 1 -maxdepth 1 ! -name ".cloakbrowser" -exec chown -R moviepilot:moviepilot {} +
+}
+
+function chown_plugin_runtime_path() {
+    local plugin_path="${1:-}"
+    [ -n "${plugin_path}" ] || return 0
+    [ -e "${plugin_path}" ] || return 0
+    local current_owner
+    current_owner="$(path_owner_id "${plugin_path}")"
+    [ "${current_owner}" = "${PUID}:${PGID}" ] && return 0
+    chown -h moviepilot:moviepilot "${plugin_path}"
+}
+
+function correct_helper_resource_permissions() {
+    local helper_dir="${IMAGE_HELPER_DIR:-/app/app/helper}"
+    [ -e "${helper_dir}" ] || return 0
+
+    INFO "→ 正在修复资源包目录权限：${helper_dir}"
+    chown -R moviepilot:moviepilot "${helper_dir}"
+}
+
+function correct_file_permissions() {
+    local chown_start
+    local chown_end
+    chown_start=$(date +%s)
+
+    INFO "→ 正在校正文件权限..."
+    force_chown_image_paths_if_requested /app /public
+    correct_helper_resource_permissions
+    chown_plugin_runtime_path /app/app/plugins
+    correct_home_permissions
+    chown -R moviepilot:moviepilot \
+        "${CONFIG_DIR}" \
+        /var/lib/nginx \
+        /var/log/nginx
+    chown moviepilot:moviepilot /etc/hosts /tmp
+
+    chown_end=$(date +%s)
+    INFO "→ 文件权限校正完成，耗时 $(( chown_end - chown_start )) 秒。"
+}
+
+# 使用env配置
+load_config_from_app_env
+apply_package_cache_env
+
+# 一次性升级标记仅影响本次启动，避免把临时升级模式带入运行中的 Python 进程
+ONE_SHOT_UPDATE_FLAG="${CONFIG_DIR}/temp/moviepilot.pending_update"
+ONE_SHOT_UPDATE_APPLIED="false"
+MOVIEPILOT_AUTO_UPDATE_ORIGINAL="${MOVIEPILOT_AUTO_UPDATE}"
+if [ -f "${ONE_SHOT_UPDATE_FLAG}" ]; then
+    ONE_SHOT_UPDATE_MODE="$(tr -d '\r\n' < "${ONE_SHOT_UPDATE_FLAG}" | tr '[:upper:]' '[:lower:]')"
+    rm -f "${ONE_SHOT_UPDATE_FLAG}"
+    if [ "${ONE_SHOT_UPDATE_MODE}" = "true" ]; then
+        ONE_SHOT_UPDATE_MODE="release"
+    fi
+    if [ "${ONE_SHOT_UPDATE_MODE}" = "release" ] || [ "${ONE_SHOT_UPDATE_MODE}" = "dev" ]; then
+        INFO "检测到一次性升级标记，本次启动将执行 ${ONE_SHOT_UPDATE_MODE} 升级..."
+        MOVIEPILOT_AUTO_UPDATE="${ONE_SHOT_UPDATE_MODE}"
+        ONE_SHOT_UPDATE_APPLIED="true"
+    elif [ -n "${ONE_SHOT_UPDATE_MODE}" ]; then
+        WARN "检测到无效的一次性升级模式：${ONE_SHOT_UPDATE_MODE}，已忽略"
+    fi
 fi
 
-# 使用 `envsubst` 将模板文件中的 ${NGINX_PORT} 替换为实际的环境变量值
-envsubst '${NGINX_PORT}${PORT}${NGINX_CLIENT_MAX_BODY_SIZE}${ENABLE_SSL}${HTTPS_SERVER_CONF}' < /etc/nginx/nginx.template.conf > /etc/nginx/nginx.conf
+# 使用env配置渲染 nginx 配置
+render_nginx_config
 
 # 自动更新
 cd /
 source /usr/local/bin/mp_update.sh
+if [ "${ONE_SHOT_UPDATE_APPLIED}" = "true" ]; then
+    MOVIEPILOT_AUTO_UPDATE="${MOVIEPILOT_AUTO_UPDATE_ORIGINAL}"
+fi
 cd /app || exit
 
 # 更改 moviepilot userid 和 groupid
@@ -220,21 +476,30 @@ groupmod -o -g "${PGID}" moviepilot
 usermod -o -u "${PUID}" moviepilot
 
 # 更改文件权限
-chown -R moviepilot:moviepilot \
-    "${HOME}" \
-    /app \
-    /public \
-    "${CONFIG_DIR}" \
-    /var/lib/nginx \
-    /var/log/nginx
-chown moviepilot:moviepilot /etc/hosts /tmp
+correct_file_permissions
+
+# 启动前优先确认主运行环境仍然健康，避免插件依赖污染导致服务直接起不来。
+ensure_backend_runtime_dependencies
 
 # 下载浏览器内核
-if [[ "$HTTPS_PROXY" =~ ^https?:// ]] || [[ "$HTTPS_PROXY" =~ ^https?:// ]] || [[ "$PROXY_HOST" =~ ^https?:// ]]; then
-  HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-$PROXY_HOST}}" gosu moviepilot:moviepilot playwright install ${PLAYWRIGHT_BROWSER_TYPE:-chromium}
-else
-  gosu moviepilot:moviepilot playwright install ${PLAYWRIGHT_BROWSER_TYPE:-chromium}
-fi
+function install_browser_kernel() {
+  local emulation="${BROWSER_EMULATION:-cloakbrowser}"
+  emulation="$(normalize_env_value "${emulation}")"
+  local proxy="${HTTPS_PROXY:-${https_proxy:-$PROXY_HOST}}"
+
+  if [ "${emulation}" != "cloakbrowser" ] && [ "${emulation}" != "flaresolverr" ] && [ -n "${emulation}" ]; then
+    WARN "浏览器仿真类型 ${emulation} 已按 CloakBrowser 处理。"
+  fi
+
+  INFO "下载 CloakBrowser 浏览器内核"
+  if [[ "$proxy" =~ ^https?:// ]]; then
+    HTTPS_PROXY="$proxy" gosu moviepilot:moviepilot python -m cloakbrowser install
+  else
+    gosu moviepilot:moviepilot python -m cloakbrowser install
+  fi
+}
+
+install_browser_kernel
 
 # 证书管理
 source /app/docker/cert.sh
@@ -242,6 +507,10 @@ source /app/docker/cert.sh
 # 启动前端nginx服务
 INFO "→ 启动前端nginx服务..."
 nginx
+
+# 捕获信号并跳转到函数
+trap 'graceful_exit 130 "signal"' SIGINT
+trap 'graceful_exit 143 "signal"' SIGTERM
 
 # 启动docker http proxy nginx
 if [ -S "/var/run/docker.sock" ]; then
@@ -256,26 +525,37 @@ fi
 # 设置后端服务权限掩码
 umask "${UMASK}"
 
-# 清除非系统环境导入的变量，保证转移到 dumb-init 的时候，不会带入不必要的环境变量
-INFO "准备为 Python 应用清理的非系统环境导入的变量..."
-if [ ${#VARS_SET_BY_SCRIPT[@]} -gt 0 ]; then
-    for var_to_unset in "${VARS_SET_BY_SCRIPT[@]}"; do
-        # 再次确认变量确实存在于当前环境中（虽然理论上应该存在）
-        if eval "[ -n \"\${${var_to_unset}+x}\" ]"; then
-            INFO "取消设置环境变量: ${var_to_unset}"
-            unset "${var_to_unset}"
-        else
-            WARN "变量 ${var_to_unset} 已不存在，无需取消设置。"
-        fi
-    done
-else
-    INFO "没有由非系统环境导入的变量需要清理。"
-fi
-
 # 启动后端服务
 INFO "→ 启动后端服务..."
+BACKEND_START_TIME="$(date +%s)"
 if [ "${START_NOGOSU:-false}" = "true" ]; then
-    exec dumb-init "${VENV_PATH}/bin/python3" app/main.py
+    "${VENV_PATH}/bin/python3" app/main.py > /dev/stdout 2> /dev/stderr &
 else
-    exec dumb-init gosu moviepilot:moviepilot "${VENV_PATH}/bin/python3" app/main.py
+    gosu moviepilot:moviepilot "${VENV_PATH}/bin/python3" app/main.py > /dev/stdout 2> /dev/stderr &
 fi
+PYTHON_PID=$!
+wait_backend_ready "${ENTRYPOINT_START_TIME}" "${BACKEND_START_TIME}" "${PYTHON_PID}" &
+
+# 等待 Python 进程退出。
+# 如果收到信号，trap 会中断 wait，并执行 graceful_exit。
+# 如果 Python 正常退出，wait 会结束，然后我们手动调用 graceful_exit。
+wait "$PYTHON_PID" 2>/dev/null
+exit_code=$?
+
+# 如果 Python 自己退出了（非信号触发），执行清理
+INTENTIONAL_RESTART_FLAG="${CONFIG_DIR}/temp/moviepilot.intentional_restart"
+if [ -f "${INTENTIONAL_RESTART_FLAG}" ]; then
+    rm -f "${INTENTIONAL_RESTART_FLAG}"
+    restart_exit_code="$exit_code"
+    if [ "$restart_exit_code" -eq 0 ]; then
+        restart_exit_code=1
+    fi
+    WARN "→ 检测到内置手动重启标记，退出容器并交给 Docker 重启策略处理..."
+    graceful_exit "$restart_exit_code" "intentional_restart"
+fi
+
+if [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 143 ]; then
+    graceful_exit "$exit_code" "python_exit"
+fi
+
+diagnostic_keepalive "$exit_code"

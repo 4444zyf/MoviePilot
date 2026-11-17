@@ -61,14 +61,30 @@ class MetaInfo(BaseModel):
     web_source: Optional[str] = None
     # 应用的识别词信息
     apply_words: Optional[List[str]] = None
+    # 剧集组
+    episode_group: Optional[str] = None
+    # 显式媒体数据源
+    media_source: Optional[str] = None
+    # 显式媒体数据源原生ID
+    media_id: Optional[str] = None
+    # TMDB ID
+    tmdbid: Optional[int] = None
+    # 豆瓣 ID
+    doubanid: Optional[str] = None
+    # Bangumi ID
+    bangumiid: Optional[int] = None
+    # AniList ID
+    anilistid: Optional[int] = None
 
 
 class MediaInfo(BaseModel):
     """
     识别媒体信息
     """
-    # 来源：themoviedb、douban、bangumi
+    # 来源：themoviedb、douban、bangumi、anilist
     source: Optional[str] = None
+    # 请求级刮削来源
+    scrape_source: Optional[str] = None
     # 类型 电影、电视剧、合集
     type: Optional[str] = None
     # 媒体标题
@@ -91,6 +107,10 @@ class MediaInfo(BaseModel):
     douban_id: Optional[str] = None
     # Bangumi ID
     bangumi_id: Optional[int] = None
+    # AniList ID
+    anilist_id: Optional[int] = None
+    # AniDB ID
+    anidb_id: Optional[int] = None
     # 合集ID
     collection_id: Optional[int] = None
     # 其它媒体ID前缀
@@ -232,10 +252,66 @@ class TorrentInfo(BaseModel):
     labels: Optional[list] = Field(default_factory=list)
     # 种子优先级
     pri_order: Optional[int] = 0
+    # 种子分类 电影/电视剧
+    category: Optional[str] = None
     # 促销
     volume_factor: Optional[str] = None
     # 剩余免费时间
     freedate_diff: Optional[str] = None
+
+
+class SubtitleInfo(BaseModel):
+    """
+    搜索字幕信息
+    """
+    # 站点ID
+    site: Optional[int] = None
+    # 站点名称
+    site_name: Optional[str] = None
+    # 站点Cookie
+    site_cookie: Optional[str] = None
+    # 站点UA
+    site_ua: Optional[str] = None
+    # 站点是否使用代理
+    site_proxy: Optional[bool] = False
+    # 站点优先级
+    site_order: Optional[int] = 0
+    # 字幕标题
+    title: Optional[str] = None
+    # 字幕描述
+    description: Optional[str] = None
+    # 字幕下载链接
+    enclosure: Optional[str] = None
+    # 详情页面
+    page_url: Optional[str] = None
+    # 语言
+    language: Optional[str] = None
+    # 语言图标
+    language_icon: Optional[str] = None
+    # 字幕大小
+    size: Optional[float] = 0.0
+    # 发布时间
+    pubdate: Optional[str] = None
+    # 已过时间
+    date_elapsed: Optional[str] = None
+    # 点击/下载次数
+    grabs: Optional[int] = 0
+    # 上传者
+    uploader: Optional[str] = None
+    # 举报页面
+    report_url: Optional[str] = None
+    # 种子ID
+    torrent_id: Optional[str] = None
+    # 字幕ID
+    subtitle_id: Optional[str] = None
+    # 下载文件名
+    file_name: Optional[str] = None
+    # 识别元数据
+    meta_info: Optional[MetaInfo] = None
+    # SxxExx
+    season_episode: Optional[str] = None
+    # 集列表
+    episode_list: Optional[List[int]] = Field(default_factory=list)
 
 
 class Context(BaseModel):
@@ -248,6 +324,16 @@ class Context(BaseModel):
     media_info: Optional[Union[MediaInfo, Any]] = None
     # 种子信息
     torrent_info: Optional[TorrentInfo] = None
+    # 候选资源来源：rss、spider、search、unknown
+    resource_source: Optional[str] = "unknown"
+    # 候选匹配来源：tmdbid、doubanid、bangumiid、anilistid、imdbid、title、plugin、unknown
+    match_source: Optional[str] = "unknown"
+    # 候选自身是否已经识别出有效媒体 ID
+    candidate_recognized: Optional[bool] = False
+    # 当前 media_info 是否为目标媒体回填
+    media_info_is_target: Optional[bool] = False
+    # 下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源
+    confirmed_full_coverage: Optional[bool] = False
 
 
 class MediaSeason(BaseModel):
@@ -267,7 +353,7 @@ class MediaPerson(BaseModel):
     """
     媒体人物信息
     """
-    # 来源：themoviedb、douban、bangumi
+    # 来源：themoviedb、douban、bangumi、anilist
     source: Optional[str] = None
     # 公共
     id: Optional[int] = None

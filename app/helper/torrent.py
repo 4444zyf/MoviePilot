@@ -1,5 +1,6 @@
 import datetime
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Tuple, Optional, List, Union, Dict, Any
 from urllib.parse import unquote
@@ -19,22 +20,64 @@ from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 
+_SIZE_UNIT = 1024 * 1024
+
+
+@lru_cache(maxsize=512)
+def _compile_filter_pattern(pattern: str) -> re.Pattern:
+    """
+    编译订阅/工作流附加过滤正则。
+    用户输入沿用原本的正则语义，缓存只减少同一规则反复匹配大量种子时的编译成本。
+    """
+    return re.compile(r"%s" % pattern, re.I)
+
+
+def _filter_pattern_search(pattern: Union[str, int, float], content: str) -> bool:
+    """
+    按原有字符串插值语义执行过滤正则匹配。
+    """
+    return bool(_compile_filter_pattern(str(pattern)).search(content))
+
+
+@lru_cache(maxsize=256)
+def _parse_filter_size_range(size_range: str) -> Tuple[str, float, Optional[float]]:
+    """
+    解析附加过滤的大小范围，单位为 MB。
+    """
+    if size_range.find("-") != -1:
+        size_min, size_max = size_range.split("-")
+        return "between", float(size_min.strip()) * _SIZE_UNIT, float(size_max.strip()) * _SIZE_UNIT
+    if size_range.startswith(">"):
+        return "gte", float(size_range[1:].strip()) * _SIZE_UNIT, None
+    if size_range.startswith("<"):
+        return "lte", 0, float(size_range[1:].strip()) * _SIZE_UNIT
+    return "unknown", 0, None
+
+
 class TorrentHelper:
     """
     种子帮助类
     """
 
     def __init__(self):
-        self._invalid_torrents = TTLCache(maxsize=128, ttl=3600 * 24)
+        """初始化种子失败地址缓存"""
+        self._invalid_torrents = TTLCache(region="invalid_torrents", maxsize=128, ttl=3600 * 24)
 
     def download_torrent(self, url: str,
                          cookie: Optional[str] = None,
                          ua: Optional[str] = None,
                          referer: Optional[str] = None,
-                         proxy: Optional[bool] = False) \
+                         proxy: Optional[bool] = False,
+                         cache_invalid: bool = True) \
             -> Tuple[Optional[Path], Optional[Union[str, bytes]], Optional[str], Optional[list], Optional[str]]:
         """
         把种子下载到本地
+        :param url: 种子下载地址
+        :param cookie: 站点 Cookie
+        :param ua: 请求 User-Agent
+        :param referer: 请求来源地址
+        :param proxy: 是否使用系统代理
+        :param cache_invalid: 是否缓存失败地址；短时凭证地址必须关闭
         :return: 种子缓存相对路径【用于索引缓存】, 种子内容、种子主目录、种子文件清单、错误信息
         """
         if url.startswith("magnet:"):
@@ -107,16 +150,16 @@ class TorrentHelper:
                                 # 检查是不是种子文件，如果不是抛出异常
                                 Torrent.from_string(req.content)
                                 # 跳过成功
-                                logger.info(f"触发了站点首次种子下载，已自动跳过：{url}")
+                                logger.info("触发了站点首次种子下载，已自动跳过")
                                 skip_flag = True
                             elif req is not None:
                                 logger.warn(f"触发了站点首次种子下载，且无法自动跳过，"
                                             f"返回码：{req.status_code}，错误原因：{req.reason}")
                             else:
-                                logger.warn(f"触发了站点首次种子下载，且无法自动跳过：{url}")
+                                logger.warn("触发了站点首次种子下载，且无法自动跳过")
                         break
                 except Exception as err:
-                    logger.warn(f"触发了站点首次种子下载，尝试自动跳过时出现错误：{str(err)}，链接：{url}")
+                    logger.warn(f"触发了站点首次种子下载，尝试自动跳过时出现错误：{str(err)}")
                 if not skip_flag:
                     return cache_path, None, "", [], "种子数据有误，请确认链接是否正确，如为PT站点则需手工在站点下载一次种子"
             # 种子内容
@@ -142,7 +185,8 @@ class TorrentHelper:
             return cache_path, None, "", [], "触发站点流控，请稍后重试"
         else:
             # 把错误的种子记下来，避免重复使用
-            self.add_invalid(url)
+            if cache_invalid:
+                self.add_invalid(url)
             return cache_path, None, "", [], f"下载种子出错，状态码：{req.status_code}"
 
     def get_torrent_info(self, torrent_path: Path) -> Tuple[str, List[str]]:
@@ -340,11 +384,11 @@ class TorrentHelper:
             episodes = list(set(episodes).union(set(meta.episode_list)))
         return episodes
 
-    def is_invalid(self, url: str) -> bool:
+    def is_invalid(self, url: Optional[str]) -> bool:
         """
         判断种子是否是无效种子
         """
-        return url in self._invalid_torrents
+        return url in self._invalid_torrents if url else True
 
     def add_invalid(self, url: str):
         """
@@ -362,7 +406,10 @@ class TorrentHelper:
         :param torrent: 种子信息
         """
         # 比对词条指定的tmdbid
-        if torrent_meta.tmdbid or torrent_meta.doubanid:
+        if any((
+                torrent_meta.tmdbid, torrent_meta.doubanid,
+                torrent_meta.bangumiid, torrent_meta.anilistid,
+        )):
             if torrent_meta.tmdbid and torrent_meta.tmdbid == mediainfo.tmdb_id:
                 logger.info(
                     f'{mediainfo.title} 通过词表指定TMDBID匹配到资源：{torrent.site_name} - {torrent.title}')
@@ -370,6 +417,14 @@ class TorrentHelper:
             if torrent_meta.doubanid and torrent_meta.doubanid == mediainfo.douban_id:
                 logger.info(
                     f'{mediainfo.title} 通过词表指定豆瓣ID匹配到资源：{torrent.site_name} - {torrent.title}')
+                return True
+            if torrent_meta.bangumiid and torrent_meta.bangumiid == mediainfo.bangumi_id:
+                logger.info(
+                    f'{mediainfo.title} 通过词表指定 Bangumi ID 匹配到资源：{torrent.site_name} - {torrent.title}')
+                return True
+            if torrent_meta.anilistid and torrent_meta.anilistid == mediainfo.anilist_id:
+                logger.info(
+                    f'{mediainfo.title} 通过词表指定 AniList ID 匹配到资源：{torrent.site_name} - {torrent.title}')
                 return True
         # 要匹配的媒体标题、原标题
         media_titles = {
@@ -460,52 +515,48 @@ class TorrentHelper:
         # 包含
         include = filter_params.get("include")
         if include:
-            if not re.search(r"%s" % include, content, re.I):
+            if not _filter_pattern_search(include, content):
                 logger.info(f"{content} 不匹配包含规则 {include}")
                 return False
         # 排除
         exclude = filter_params.get("exclude")
         if exclude:
-            if re.search(r"%s" % exclude, content, re.I):
+            if _filter_pattern_search(exclude, content):
                 logger.info(f"{content} 匹配排除规则 {exclude}")
                 return False
         # 质量
         quality = filter_params.get("quality")
         if quality:
-            if not re.search(r"%s" % quality, torrent_info.title, re.I):
+            if not _filter_pattern_search(quality, torrent_info.title):
                 logger.info(f"{torrent_info.title} 不匹配质量规则 {quality}")
                 return False
         # 分辨率
         resolution = filter_params.get("resolution")
         if resolution:
-            if not re.search(r"%s" % resolution, torrent_info.title, re.I):
+            if not _filter_pattern_search(resolution, torrent_info.title):
                 logger.info(f"{torrent_info.title} 不匹配分辨率规则 {resolution}")
                 return False
         # 特效
         effect = filter_params.get("effect")
         if effect:
-            if not re.search(r"%s" % effect, torrent_info.title, re.I):
+            if not _filter_pattern_search(effect, torrent_info.title):
                 logger.info(f"{torrent_info.title} 不匹配特效规则 {effect}")
                 return False
 
         # 大小
         size_range = filter_params.get("size")
         if size_range:
-            if size_range.find("-") != -1:
+            size_rule, size_min, size_max = _parse_filter_size_range(size_range)
+            if size_rule == "between":
                 # 区间
-                size_min, size_max = size_range.split("-")
-                size_min = float(size_min.strip()) * 1024 * 1024
-                size_max = float(size_max.strip()) * 1024 * 1024
                 if torrent_info.size < size_min or torrent_info.size > size_max:
                     return False
-            elif size_range.startswith(">"):
+            elif size_rule == "gte":
                 # 大于
-                size_min = float(size_range[1:].strip()) * 1024 * 1024
                 if torrent_info.size < size_min:
                     return False
-            elif size_range.startswith("<"):
+            elif size_rule == "lte":
                 # 小于
-                size_max = float(size_range[1:].strip()) * 1024 * 1024
                 if torrent_info.size > size_max:
                     return False
 
@@ -521,6 +572,7 @@ class TorrentHelper:
         """
         # 匹配季
         seasons = season_episodes.keys()
+        seasons_set = set(seasons)
         # 种子季
         torrent_seasons = meta.season_list
         if not torrent_seasons:
@@ -528,7 +580,7 @@ class TorrentHelper:
             torrent_seasons = [1]
         # 种子集
         torrent_episodes = meta.episode_list
-        if not set(torrent_seasons).issubset(set(seasons)):
+        if not set(torrent_seasons).issubset(seasons_set):
             # 种子季不在过滤季中
             logger.debug(
                 f"种子 {torrent.site_name} - {torrent.title} 包含季 {torrent_seasons} 不是需要的季 {list(seasons)}")
@@ -539,7 +591,7 @@ class TorrentHelper:
         if len(torrent_seasons) == 1:
             need_episodes = season_episodes.get(torrent_seasons[0])
             if need_episodes \
-                    and not set(torrent_episodes).intersection(set(need_episodes)):
+                    and not set(torrent_episodes).intersection(need_episodes):
                 # 单季集没有交集的不要
                 logger.debug(f"种子 {torrent.site_name} - {torrent.title} "
                              f"集 {torrent_episodes} 没有需要的集：{need_episodes}")

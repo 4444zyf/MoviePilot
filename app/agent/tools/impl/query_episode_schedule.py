@@ -6,23 +6,25 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
-from app.chain.media import MediaChain
+from app.agent.tools.tags import ToolTag
 from app.chain.tmdb import TmdbChain
 from app.log import logger
-from app.schemas import MediaType
 
 
 class QueryEpisodeScheduleInput(BaseModel):
     """查询剧集上映时间工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-    tmdb_id: int = Field(..., description="TMDB ID of the TV series")
+    tmdb_id: int = Field(..., description="TMDB ID of the TV series (can be obtained from search_media tool)")
     season: int = Field(..., description="Season number to query")
     episode_group: Optional[str] = Field(None, description="Episode group ID (optional)")
 
 
 class QueryEpisodeScheduleTool(MoviePilotTool):
     name: str = "query_episode_schedule"
-    description: str = "Query TV series episode air dates and schedule. Returns detailed information for each episode including air date, episode number, title, overview, and other metadata. Filters out episodes without air dates."
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+    ]
+    description: str = "Query TV series episode air dates and schedule. Returns non-duplicated schedule fields, including episode list, air-date statistics, and per-episode metadata. Filters out episodes without air dates."
     args_schema: Type[BaseModel] = QueryEpisodeScheduleInput
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
@@ -31,7 +33,7 @@ class QueryEpisodeScheduleTool(MoviePilotTool):
         season = kwargs.get("season")
         episode_group = kwargs.get("episode_group")
 
-        message = f"正在查询剧集上映时间: TMDB ID {tmdb_id} 第{season}季"
+        message = f"查询剧集上映时间: TMDB ID {tmdb_id} 第{season}季"
         if episode_group:
             message += f" (剧集组: {episode_group})"
 
@@ -41,12 +43,6 @@ class QueryEpisodeScheduleTool(MoviePilotTool):
         logger.info(f"执行工具: {self.name}, 参数: tmdb_id={tmdb_id}, season={season}, episode_group={episode_group}")
 
         try:
-            # 获取媒体信息（用于获取标题和海报）
-            media_chain = MediaChain()
-            mediainfo = await media_chain.async_recognize_media(tmdbid=tmdb_id, mtype=MediaType.TV)
-            if not mediainfo:
-                return f"未找到 TMDB ID {tmdb_id} 的媒体信息"
-
             # 获取集列表
             tmdb_chain = TmdbChain()
             episodes = await tmdb_chain.async_tmdb_episodes(
@@ -92,12 +88,7 @@ class QueryEpisodeScheduleTool(MoviePilotTool):
             episode_list.sort(key=lambda x: (x["air_date"] or "", x["episode_number"] or 0))
 
             result = {
-                "success": True,
-                "tmdb_id": tmdb_id,
                 "season": season,
-                "episode_group": episode_group,
-                "series_title": mediainfo.title if mediainfo else None,
-                "series_poster": mediainfo.poster_path if mediainfo else None,
                 "total_episodes": len(episodes),
                 "episodes_with_air_date": len(episode_list),
                 "episodes": episode_list

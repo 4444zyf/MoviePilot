@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from app.db import DbOper
 from app.db.models.downloadhistory import DownloadHistory, DownloadFiles
@@ -23,13 +23,40 @@ class DownloadHistoryOper(DbOper):
         """
         return DownloadHistory.get_by_hash(self._db, download_hash)
 
-    def get_by_mediaid(self, tmdbid: int, doubanid: str) -> List[DownloadHistory]:
+    def get_by_hashes(self, download_hashes: List[str]) -> Dict[str, DownloadHistory]:
+        """
+        批量按 Hash 查询下载记录，并返回以 Hash 为键的映射。
+        """
+        histories = DownloadHistory.get_by_hashes(self._db, download_hashes)
+        return {
+            history.download_hash: history
+            for history in histories
+            if history and history.download_hash
+        }
+
+    def get_by_mediaid(
+            self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+            bangumiid: Optional[int] = None, anilistid: Optional[int] = None,
+            media_source: Optional[str] = None, media_id: Optional[str] = None,
+    ) -> List[DownloadHistory]:
         """
         按媒体ID查询下载记录
         :param tmdbid: tmdbid
         :param doubanid: doubanid
+        :param bangumiid: Bangumi ID
+        :param anilistid: AniList ID
+        :param media_source: 媒体数据源
+        :param media_id: 数据源原生 ID
         """
-        return DownloadHistory.get_by_mediaid(self._db, tmdbid=tmdbid, doubanid=doubanid)
+        return DownloadHistory.get_by_mediaid(
+            self._db,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
+            media_source=media_source,
+            media_id=media_id,
+        )
 
     def add(self, **kwargs):
         """
@@ -102,6 +129,12 @@ class DownloadHistoryOper(DbOper):
         分页查询下载历史
         """
         return DownloadHistory.list_by_page(self._db, page, count)
+
+    async def async_delete_history(self, historyid: int):
+        """
+        异步删除下载记录。
+        """
+        await DownloadHistory.async_delete(self._db, historyid)
 
     def truncate(self):
         """

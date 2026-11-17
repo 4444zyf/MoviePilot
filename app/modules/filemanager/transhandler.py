@@ -13,8 +13,17 @@ from app.helper.directory import DirectoryHelper
 from app.helper.message import TemplateHelper
 from app.log import logger
 from app.modules.filemanager.storages import StorageBase
-from app.schemas import TransferInfo, TmdbEpisode, TransferDirectoryConf, FileItem, TransferInterceptEventData, \
-    TransferRenameEventData
+from app.schemas import (
+    TransferInfo,
+    TmdbEpisode,
+    TransferDirectoryConf,
+    FileItem,
+    TransferInterceptEventData,
+    TransferOverwriteCheckEventData,
+    TransferRenameBuildEventData,
+    TransferRenameEventData,
+)
+from app.schemas.exception import StorageQueryError
 from app.schemas.types import MediaType, ChainEventType
 from app.utils.system import SystemUtils
 
@@ -26,6 +35,49 @@ class TransHandler:
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def __normalize_disc_folder_name(value: Optional[str]) -> Optional[str]:
+        """
+        从 Disc/Disk/DVD/CD 标识中提取盘号并统一为 Disc N。
+        """
+        if not value:
+            return None
+        match = re.search(
+            r"(?:disc|disk|dvd|cd)[\s._-]*0*(\d{1,3})",
+            value,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return f"Disc {int(match.group(1))}"
+
+    @classmethod
+    def __get_tv_bluray_dir_path(
+            cls,
+            rendered_path: Path,
+            source_item: FileItem,
+            meta: MetaBase,
+    ) -> Path:
+        """
+        电视剧原盘目录没有单集文件名，保留季目录并追加盘片目录。
+        """
+        disc_folder = cls.__normalize_disc_folder_name(getattr(meta, "part", None))
+        if not disc_folder and source_item:
+            source_name = source_item.name or Path(source_item.path).name
+            disc_folder = cls.__normalize_disc_folder_name(source_name)
+            if not disc_folder:
+                match = re.search(
+                    r"(?:^|[^A-Za-z0-9])S\d{1,3}D0*(\d{1,3})(?:[^A-Za-z0-9]|$)",
+                    source_name,
+                    re.IGNORECASE,
+                )
+                if match:
+                    disc_folder = f"Disc {int(match.group(1))}"
+            if not disc_folder:
+                disc_folder = source_name
+
+        return rendered_path.parent / (disc_folder or "Disc")
 
     @staticmethod
     def __update_result(result: TransferInfo, **kwargs):
@@ -51,26 +103,48 @@ class TransHandler:
                 elif isinstance(current_value, bool):
                     current_value = value
                 elif isinstance(current_value, int):
-                    current_value += (value or 0)
+                    current_value += value or 0
                 else:
                     current_value = value
                 setattr(result, key, current_value)
 
-    def transfer_media(self,
-                       fileitem: FileItem,
-                       in_meta: MetaBase,
-                       mediainfo: MediaInfo,
-                       target_storage: str,
-                       target_path: Path,
-                       transfer_type: str,
-                       source_oper: StorageBase,
-                       target_oper: StorageBase,
-                       need_scrape: Optional[bool] = False,
-                       need_rename: Optional[bool] = True,
-                       need_notify: Optional[bool] = True,
-                       overwrite_mode: Optional[str] = None,
-                       episodes_info: List[TmdbEpisode] = None
-                       ) -> TransferInfo:
+    @staticmethod
+    def __build_preview_item(
+            storage: str,
+            path: Path,
+            item_type: str,
+            size: Optional[int] = None,
+    ) -> FileItem:
+        """
+        构造预览结果中的文件项，不访问真实存储。
+        """
+        return FileItem(
+            storage=storage,
+            path=path.as_posix(),
+            name=path.name,
+            basename=path.stem,
+            type=item_type,
+            extension=path.suffix.lstrip(".") if item_type == "file" else None,
+            size=size if item_type == "file" else None,
+        )
+
+    def transfer_media(
+        self,
+        fileitem: FileItem,
+        in_meta: MetaBase,
+        mediainfo: MediaInfo,
+        target_storage: str,
+        target_path: Path,
+        transfer_type: str,
+        source_oper: StorageBase,
+        target_oper: StorageBase,
+        need_scrape: Optional[bool] = False,
+        need_rename: Optional[bool] = True,
+        need_notify: Optional[bool] = True,
+        overwrite_mode: Optional[str] = None,
+        episodes_info: List[TmdbEpisode] = None,
+        preview: Optional[bool] = False,
+    ) -> TransferInfo:
         """
         识别并整理一个文件或者一个目录下的所有文件
         :param fileitem: 整理的文件对象，可能是一个文件也可以是一个目录
@@ -86,6 +160,7 @@ class TransHandler:
         :param need_notify: 是否需要通知
         :param overwrite_mode: 覆盖模式
         :param episodes_info: 当前季的全部集信息
+        :param preview: 是否仅预览
         :return: TransferInfo、错误信息
         """
 
@@ -109,15 +184,31 @@ class TransHandler:
             """
             if not _fileitem.extension:
                 return False
-            if f".{_fileitem.extension.lower()}" in (settings.RMT_SUBEXT + settings.RMT_AUDIOEXT):
+            if f".{_fileitem.extension.lower()}" in (
+                settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
+            ):
                 return True
             return False
+
+        def __is_special_extra_file(_fileitem: FileItem) -> bool:
+            """
+            判断是否为特典/附加视频文件（如 NCOP/NCED/Menu/CM/PV/Event/Logo 等无集数编号的视频/样本）
+            """
+            file_name = _fileitem.name or ""
+            return bool(
+                re.search(
+                    r"(?:^|[\s_.\-\[【(])("
+                    r"NC(?:OP|ED)|NCOP|NCED|OP|ED|MENU|PV|CM|TRAILER|TV\s*SPOT|SP|OVA|OAD|EVENT|IV|INTERVIEW|LOGO|PRODUCER\s*LOGO|BEHIND\s*THE\s*SCENES|FEATURETTE"
+                    r")(?:\d*|[\s_.\-\]】)]|$)",
+                    file_name,
+                    re.IGNORECASE,
+                )
+            )
 
         # 整理结果
         result = TransferInfo()
 
         try:
-
             # 重命名格式
             rename_format = settings.RENAME_FORMAT(mediainfo.type)
 
@@ -125,15 +216,25 @@ class TransHandler:
             if fileitem.type == "dir":
                 # 整理整个目录，一般为蓝光原盘
                 if need_rename:
-                    new_path = self.get_rename_path(
+                    rendered_path = self.get_rename_path(
                         path=target_path,
                         template_string=rename_format,
-                        rename_dict=self.get_naming_dict(meta=in_meta,
-                                                         mediainfo=mediainfo)
+                        rename_dict=self.get_naming_dict(
+                            meta=in_meta, mediainfo=mediainfo
+                        ),
+                        source_path=fileitem.path,
+                        source_item=fileitem,
                     )
-                    new_path = DirectoryHelper.get_media_root_path(
-                        rename_format, rename_path=new_path
-                    )
+                    if mediainfo.type == MediaType.TV:
+                        new_path = self.__get_tv_bluray_dir_path(
+                            rendered_path=rendered_path,
+                            source_item=fileitem,
+                            meta=in_meta,
+                        )
+                    else:
+                        new_path = DirectoryHelper.get_media_root_path(
+                            rename_format, rename_path=rendered_path
+                        )
                     if not new_path:
                         self.__update_result(
                             result=result,
@@ -146,56 +247,94 @@ class TransHandler:
                         return result
                 else:
                     new_path = target_path / fileitem.name
+                if preview:
+                    preview_diritem = self.__build_preview_item(
+                        storage=target_storage,
+                        path=new_path,
+                        item_type="dir",
+                    )
+                    self.__update_result(
+                        result=result,
+                        success=True,
+                        fileitem=fileitem,
+                        target_item=preview_diritem,
+                        target_diritem=preview_diritem,
+                        file_list=[fileitem.path],
+                        file_list_new=[new_path.as_posix()],
+                        need_scrape=need_scrape,
+                        need_notify=False,
+                        transfer_type=transfer_type,
+                    )
+                    return result
                 # 原盘大小只计算STREAM目录内的文件大小
                 if stream_fileitem := source_oper.get_item(
-                        Path(fileitem.path) / "BDMV" / "STREAM"
+                    Path(fileitem.path) / "BDMV" / "STREAM"
                 ):
                     fileitem.size = sum(
                         file.size for file in source_oper.list(stream_fileitem) or []
                     )
                 # 整理目录
-                new_diritem, errmsg = self.__transfer_dir(fileitem=fileitem,
-                                                          mediainfo=mediainfo,
-                                                          source_oper=source_oper,
-                                                          target_oper=target_oper,
-                                                          target_storage=target_storage,
-                                                          target_path=new_path,
-                                                          transfer_type=transfer_type,
-                                                          result=result)
+                new_diritem, errmsg = self.__transfer_dir(
+                    fileitem=fileitem,
+                    mediainfo=mediainfo,
+                    source_oper=source_oper,
+                    target_oper=target_oper,
+                    target_storage=target_storage,
+                    target_path=new_path,
+                    transfer_type=transfer_type,
+                    result=result,
+                )
                 if not new_diritem:
                     logger.error(f"文件夹 {fileitem.path} 整理失败：{errmsg}")
-                    self.__update_result(result=result,
-                                         success=False,
-                                         message=errmsg,
-                                         fileitem=fileitem,
-                                         transfer_type=transfer_type,
-                                         need_notify=need_notify)
+                    self.__update_result(
+                        result=result,
+                        success=False,
+                        message=errmsg,
+                        fileitem=fileitem,
+                        transfer_type=transfer_type,
+                        need_notify=need_notify,
+                    )
                     return result
 
                 logger.info(f"文件夹 {fileitem.path} 整理成功")
                 # 返回整理后的路径
-                self.__update_result(result=result,
-                                     success=True,
-                                     fileitem=fileitem,
-                                     target_item=new_diritem,
-                                     target_diritem=new_diritem,
-                                     need_scrape=need_scrape,
-                                     need_notify=need_notify,
-                                     transfer_type=transfer_type)
+                self.__update_result(
+                    result=result,
+                    success=True,
+                    fileitem=fileitem,
+                    target_item=new_diritem,
+                    target_diritem=new_diritem,
+                    need_scrape=need_scrape,
+                    need_notify=need_notify,
+                    transfer_type=transfer_type,
+                )
                 return result
             else:
                 # 整理单个文件
                 if mediainfo.type == MediaType.TV:
                     # 电视剧
                     if in_meta.begin_episode is None:
+                        if __is_special_extra_file(fileitem):
+                            logger.info(f"文件 {fileitem.path} 未识别到文件集数，识别为特典/附加视频文件，跳过正片集数整理")
+                            self.__update_result(
+                                result=result,
+                                success=True,
+                                fileitem=fileitem,
+                                transfer_type=transfer_type,
+                                need_notify=False,
+                            )
+                            return result
+
                         logger.warn(f"文件 {fileitem.path} 整理失败：未识别到文件集数")
-                        self.__update_result(result=result,
-                                             success=False,
-                                             message="未识别到文件集数",
-                                             fileitem=fileitem,
-                                             fail_list=[fileitem.path],
-                                             transfer_type=transfer_type,
-                                             need_notify=need_notify)
+                        self.__update_result(
+                            result=result,
+                            success=False,
+                            message="未识别到文件集数",
+                            fileitem=fileitem,
+                            fail_list=[fileitem.path],
+                            transfer_type=transfer_type,
+                            need_notify=need_notify,
+                        )
                         return result
 
                     # 文件结束季为空
@@ -217,8 +356,10 @@ class TransHandler:
                             meta=in_meta,
                             mediainfo=mediainfo,
                             episodes_info=episodes_info,
-                            file_ext=f".{fileitem.extension}"
-                        )
+                            file_ext=f".{fileitem.extension}",
+                        ),
+                        source_path=fileitem.path,
+                        source_item=fileitem,
                     )
 
                     # 针对字幕文件，文件名中补充额外标识信息
@@ -245,23 +386,69 @@ class TransHandler:
                     folder_path = target_path
 
                 # 目标目录
+                if preview:
+                    # 预览只做路径推算，不检查目录或同名文件冲突，避免目标存储探测触发真实整理。
+                    target_diritem = self.__build_preview_item(
+                        storage=target_storage,
+                        path=folder_path,
+                        item_type="dir",
+                    )
+                    target_item = self.__build_preview_item(
+                        storage=target_storage,
+                        path=new_file,
+                        item_type="file",
+                        size=fileitem.size,
+                    )
+                    self.__update_result(
+                        result=result,
+                        success=True,
+                        fileitem=fileitem,
+                        target_item=target_item,
+                        target_diritem=target_diritem,
+                        file_list=[fileitem.path],
+                        file_list_new=[new_file.as_posix()],
+                        file_count=1,
+                        total_size=fileitem.size or 0,
+                        need_scrape=need_scrape,
+                        transfer_type=transfer_type,
+                        need_notify=False,
+                    )
+                    return result
+
                 target_diritem = target_oper.get_folder(folder_path)
                 if not target_diritem:
                     logger.error(f"目标目录 {folder_path} 获取失败")
-                    self.__update_result(result=result,
-                                         success=False,
-                                         message=f"目标目录 {folder_path} 获取失败",
-                                         fileitem=fileitem,
-                                         fail_list=[fileitem.path],
-                                         transfer_type=transfer_type,
-                                         need_notify=need_notify)
+                    self.__update_result(
+                        result=result,
+                        success=False,
+                        message=f"目标目录 {folder_path} 获取失败",
+                        fileitem=fileitem,
+                        fail_list=[fileitem.path],
+                        transfer_type=transfer_type,
+                        need_notify=need_notify,
+                    )
                     return result
 
                 # 判断是否要覆盖，附加文件强制覆盖
                 overflag = False
                 if not __is_extra_file(fileitem):
-                    # 目标文件
-                    target_item = target_oper.get_item(new_file)
+                    # 目标文件（严格查询：无法确认状态时拒绝覆盖，避免已有文件被误覆盖）
+                    try:
+                        target_item = target_oper.get_item_strict(new_file)
+                    except StorageQueryError as query_err:
+                        errmsg = f"无法确认目标文件状态，已跳过整理以避免误覆盖：{new_file} - {query_err}"
+                        logger.warn(errmsg)
+                        self.__update_result(
+                            result=result,
+                            success=False,
+                            message=errmsg,
+                            fileitem=fileitem,
+                            target_diritem=target_diritem,
+                            fail_list=[fileitem.path],
+                            transfer_type=transfer_type,
+                            need_notify=need_notify,
+                        )
+                        return result
                     if target_item:
                         # 目标文件已存在
                         target_file = new_file
@@ -272,88 +459,174 @@ class TransHandler:
                         if not overflag:
                             # 目标文件已存在
                             logger.info(
-                                f"目的文件系统中已经存在同名文件 {target_file}，当前整理覆盖模式设置为 {overwrite_mode}")
-                            if overwrite_mode == 'always':
+                                f"目的文件系统中已经存在同名文件 {target_file}，当前整理覆盖模式设置为 {overwrite_mode}"
+                            )
+                            # 触发覆盖检查事件，允许插件提供源/目标文件真实大小
+                            # 或直接给出覆盖决策（例如 .strm 文件指向网盘原始文件）
+                            overwrite_event_data = TransferOverwriteCheckEventData(
+                                fileitem=fileitem,
+                                target_item=target_item,
+                                target_storage=target_storage,
+                                target_path=new_file,
+                                overwrite_mode=overwrite_mode or "",
+                                transfer_type=transfer_type,
+                            )
+                            overwrite_event = eventmanager.send_event(
+                                ChainEventType.TransferOverwriteCheck,
+                                overwrite_event_data,
+                            )
+                            plugin_overwrite: Optional[bool] = None
+                            plugin_source_size: Optional[int] = None
+                            plugin_target_size: Optional[int] = None
+                            if overwrite_event and overwrite_event.event_data:
+                                overwrite_event_data = overwrite_event.event_data
+                                plugin_overwrite = overwrite_event_data.overwrite
+                                plugin_source_size = overwrite_event_data.source_size
+                                plugin_target_size = overwrite_event_data.target_size
+                                if (
+                                    plugin_overwrite is not None
+                                    or plugin_source_size is not None
+                                    or plugin_target_size is not None
+                                ):
+                                    logger.info(
+                                        f"覆盖检查事件由 {overwrite_event_data.source} 处理："
+                                        f"overwrite={plugin_overwrite}, "
+                                        f"source_size={plugin_source_size}, "
+                                        f"target_size={plugin_target_size}, "
+                                        f"reason={overwrite_event_data.reason}"
+                                    )
+                            if plugin_overwrite is True:
+                                overflag = True
+                            elif plugin_overwrite is False:
+                                self.__update_result(
+                                    result=result,
+                                    success=False,
+                                    message=overwrite_event_data.reason
+                                    or "插件决定不覆盖已有文件",
+                                    fileitem=fileitem,
+                                    target_item=target_item,
+                                    target_diritem=target_diritem,
+                                    fail_list=[fileitem.path],
+                                    transfer_type=transfer_type,
+                                    need_notify=need_notify,
+                                )
+                                return result
+                            elif overwrite_mode == "always":
                                 # 总是覆盖同名文件
                                 overflag = True
-                            elif overwrite_mode == 'size':
+                            elif overwrite_mode == "size":
                                 # 存在时大覆盖小
-                                if target_item.size < fileitem.size:
-                                    logger.info(f"目标文件文件大小更小，将覆盖：{new_file}")
+                                source_size = (
+                                    plugin_source_size
+                                    if plugin_source_size is not None
+                                    else fileitem.size
+                                )
+                                target_size = (
+                                    plugin_target_size
+                                    if plugin_target_size is not None
+                                    else target_item.size
+                                )
+                                if target_size < source_size:
+                                    logger.info(
+                                        f"目标文件文件大小更小，将覆盖：{new_file}"
+                                    )
                                     overflag = True
                                 else:
-                                    self.__update_result(result=result,
-                                                         success=False,
-                                                         message=f"媒体库存在同名文件，且质量更好",
-                                                         fileitem=fileitem,
-                                                         target_item=target_item,
-                                                         target_diritem=target_diritem,
-                                                         fail_list=[fileitem.path],
-                                                         transfer_type=transfer_type,
-                                                         need_notify=need_notify)
+                                    self.__update_result(
+                                        result=result,
+                                        success=False,
+                                        message=f"媒体库存在同名文件，且质量更好",
+                                        fileitem=fileitem,
+                                        target_item=target_item,
+                                        target_diritem=target_diritem,
+                                        fail_list=[fileitem.path],
+                                        transfer_type=transfer_type,
+                                        need_notify=need_notify,
+                                    )
                                     return result
-                            elif overwrite_mode == 'never':
+                            elif overwrite_mode == "never":
                                 # 存在不覆盖
-                                self.__update_result(result=result,
-                                                     message=f"媒体库存在同名文件，当前覆盖模式为不覆盖",
-                                                     fileitem=fileitem,
-                                                     target_item=target_item,
-                                                     target_diritem=target_diritem,
-                                                     fail_list=[fileitem.path],
-                                                     transfer_type=transfer_type,
-                                                     need_notify=need_notify)
+                                self.__update_result(
+                                    result=result,
+                                    success=False,
+                                    message=f"媒体库存在同名文件，当前覆盖模式为不覆盖",
+                                    fileitem=fileitem,
+                                    target_item=target_item,
+                                    target_diritem=target_diritem,
+                                    fail_list=[fileitem.path],
+                                    transfer_type=transfer_type,
+                                    need_notify=need_notify,
+                                )
                                 return result
-                            elif overwrite_mode == 'latest':
+                            elif overwrite_mode == "latest":
                                 # 仅保留最新版本
-                                logger.info(f"当前整理覆盖模式设置为仅保留最新版本，将覆盖：{new_file}")
+                                logger.info(
+                                    f"当前整理覆盖模式设置为仅保留最新版本，将覆盖：{new_file}"
+                                )
                                 overflag = True
                     else:
-                        if overwrite_mode == 'latest':
+                        if overwrite_mode == "latest":
                             # 文件不存在，但仅保留最新版本
                             logger.info(
-                                f"当前整理覆盖模式设置为 {overwrite_mode}，仅保留最新版本，正在删除已有版本文件 ...")
+                                f"当前整理覆盖模式设置为 {overwrite_mode}，仅保留最新版本，正在删除已有版本文件 ..."
+                            )
                             self.__delete_version_files(target_oper, new_file)
+                else:
+                    # 附加文件 总是需要覆盖
+                    overflag = True
 
                 # 整理文件
-                new_item, err_msg = self.__transfer_file(fileitem=fileitem,
-                                                         mediainfo=mediainfo,
-                                                         target_storage=target_storage,
-                                                         target_file=new_file,
-                                                         transfer_type=transfer_type,
-                                                         over_flag=overflag,
-                                                         source_oper=source_oper,
-                                                         target_oper=target_oper,
-                                                         result=result)
+                new_item, err_msg = self.__transfer_file(
+                    fileitem=fileitem,
+                    meta=in_meta,
+                    mediainfo=mediainfo,
+                    target_storage=target_storage,
+                    target_file=new_file,
+                    transfer_type=transfer_type,
+                    over_flag=overflag,
+                    source_oper=source_oper,
+                    target_oper=target_oper,
+                    result=result,
+                )
                 if not new_item:
+                    err_msg = err_msg or f"{fileitem.path} 整理后未获取到目标文件信息"
                     logger.error(f"文件 {fileitem.path} 整理失败：{err_msg}")
-                    self.__update_result(result=result,
-                                         success=False,
-                                         message=err_msg,
-                                         fileitem=fileitem,
-                                         fail_list=[fileitem.path],
-                                         transfer_type=transfer_type,
-                                         need_notify=need_notify)
+                    self.__update_result(
+                        result=result,
+                        success=False,
+                        message=err_msg,
+                        fileitem=fileitem,
+                        fail_list=[fileitem.path],
+                        transfer_type=transfer_type,
+                        need_notify=need_notify,
+                    )
                     return result
 
                 logger.info(f"文件 {fileitem.path} 整理成功")
-                self.__update_result(result=result,
-                                     success=True,
-                                     fileitem=fileitem,
-                                     target_item=new_item,
-                                     target_diritem=target_diritem,
-                                     need_scrape=need_scrape,
-                                     transfer_type=transfer_type,
-                                     need_notify=need_notify)
+                self.__update_result(
+                    result=result,
+                    success=True,
+                    fileitem=fileitem,
+                    target_item=new_item,
+                    target_diritem=target_diritem,
+                    need_scrape=need_scrape,
+                    transfer_type=transfer_type,
+                    need_notify=need_notify,
+                )
                 return result
         except Exception as e:
             logger.error(f"媒体整理出错：{e}")
             return TransferInfo(success=False, message=str(e))
 
     @staticmethod
-    def __transfer_command(fileitem: FileItem, target_storage: str,
-                           source_oper: StorageBase, target_oper: StorageBase,
-                           target_file: Path, transfer_type: str,
-                           ) -> Tuple[Optional[FileItem], str]:
+    def __transfer_command(
+        fileitem: FileItem,
+        target_storage: str,
+        source_oper: StorageBase,
+        target_oper: StorageBase,
+        target_file: Path,
+        transfer_type: str,
+    ) -> Tuple[Optional[FileItem], str]:
         """
         处理单个文件
         :param fileitem: 源文件
@@ -375,12 +648,43 @@ class TransHandler:
                 basename=_path.stem,
                 type="file",
                 size=_path.stat().st_size,
-                extension=_path.suffix.lstrip('.'),
-                modify_time=_path.stat().st_mtime
+                extension=_path.suffix.lstrip("."),
+                modify_time=_path.stat().st_mtime,
             )
 
-        if (fileitem.storage != target_storage
-                and fileitem.storage != "local" and target_storage != "local"):
+        def __build_remote_targetitem(_source_item: FileItem, _path: Path) -> FileItem:
+            """
+            根据已确认的目标路径构造网盘文件信息，用于兼容元数据延迟可见的存储。
+            """
+            return FileItem(
+                storage=target_storage,
+                path=_path.as_posix(),
+                name=_path.name,
+                basename=_path.stem,
+                type=_source_item.type or "file",
+                size=_source_item.size,
+                extension=_path.suffix.lstrip("."),
+                modify_time=_source_item.modify_time,
+                thumbnail=_source_item.thumbnail,
+            )
+
+        def __get_remote_targetitem(_source_item: FileItem, _path: Path) -> FileItem:
+            """
+            获取网盘目标文件信息，目标存储索引未刷新时使用目标路径兜底。
+            """
+            target_item = target_oper.get_item(_path)
+            if target_item:
+                return target_item
+            logger.warn(
+                f"目标文件【{target_storage}】{_path} 元数据暂不可见，使用目标路径构造整理结果"
+            )
+            return __build_remote_targetitem(_source_item, _path)
+
+        if (
+            fileitem.storage != target_storage
+            and fileitem.storage != "local"
+            and target_storage != "local"
+        ):
             return None, f"不支持 {fileitem.storage} 到 {target_storage} 的文件整理"
 
         if fileitem.storage == "local" and target_storage == "local":
@@ -413,20 +717,27 @@ class TransHandler:
                 target_fileitem = target_oper.get_folder(target_file.parent)
                 if target_fileitem:
                     # 上传文件
-                    new_item = target_oper.upload(target_fileitem, filepath, target_file.name)
+                    new_item = target_oper.upload(
+                        target_fileitem, filepath, target_file.name
+                    )
                     if new_item:
                         return new_item, ""
                     else:
                         return None, f"{fileitem.path} 上传 {target_storage} 失败"
                 else:
-                    return None, f"【{target_storage}】{target_file.parent} 目录获取失败"
+                    return (
+                        None,
+                        f"【{target_storage}】{target_file.parent} 目录获取失败",
+                    )
             elif transfer_type == "move":
                 # 移动
                 # 根据目的路径获取文件夹
                 target_fileitem = target_oper.get_folder(target_file.parent)
                 if target_fileitem:
                     # 上传文件
-                    new_item = target_oper.upload(target_fileitem, filepath, target_file.name)
+                    new_item = target_oper.upload(
+                        target_fileitem, filepath, target_file.name
+                    )
                     if new_item:
                         # 删除源文件
                         source_oper.delete(fileitem)
@@ -434,7 +745,10 @@ class TransHandler:
                     else:
                         return None, f"{fileitem.path} 上传 {target_storage} 失败"
                 else:
-                    return None, f"【{target_storage}】{target_file.parent} 目录获取失败"
+                    return (
+                        None,
+                        f"【{target_storage}】{target_file.parent} 目录获取失败",
+                    )
         elif fileitem.storage != "local" and target_storage == "local":
             # 网盘到本地
             if target_file.exists():
@@ -443,7 +757,9 @@ class TransHandler:
             # 网盘到本地
             if transfer_type in ["copy", "move"]:
                 # 下载
-                tmp_file = source_oper.download(fileitem=fileitem, path=target_file.parent)
+                tmp_file = source_oper.download(
+                    fileitem=fileitem, path=target_file.parent
+                )
                 if tmp_file:
                     # 创建目录
                     if not target_file.parent.exists():
@@ -465,25 +781,47 @@ class TransHandler:
                 # 复制文件到新目录
                 target_fileitem = target_oper.get_folder(target_file.parent)
                 if target_fileitem:
-                    if source_oper.copy(fileitem, Path(target_fileitem.path), target_file.name):
-                        return target_oper.get_item(target_file), ""
-                    else:
-                        return None, f"【{target_storage}】{fileitem.path} 复制文件失败"
+                    copy_item = getattr(source_oper, "copy_item", None)
+                    if callable(copy_item):
+                        new_item = copy_item(
+                            fileitem, Path(target_fileitem.path), target_file.name
+                        )
+                        if new_item:
+                            return new_item, ""
+                    elif source_oper.copy(
+                            fileitem, Path(target_fileitem.path), target_file.name
+                    ):
+                        return __get_remote_targetitem(fileitem, target_file), ""
+                    return None, f"【{target_storage}】{fileitem.path} 复制文件失败"
                 else:
-                    return None, f"【{target_storage}】{target_file.parent} 目录获取失败"
+                    return (
+                        None,
+                        f"【{target_storage}】{target_file.parent} 目录获取失败",
+                    )
             elif transfer_type == "move":
                 # 移动文件到新目录
                 target_fileitem = target_oper.get_folder(target_file.parent)
                 if target_fileitem:
-                    if source_oper.move(fileitem, Path(target_fileitem.path), target_file.name):
-                        return target_oper.get_item(target_file), ""
-                    else:
-                        return None, f"【{target_storage}】{fileitem.path} 移动文件失败"
+                    move_item = getattr(source_oper, "move_item", None)
+                    if callable(move_item):
+                        new_item = move_item(
+                            fileitem, Path(target_fileitem.path), target_file.name
+                        )
+                        if new_item:
+                            return new_item, ""
+                    elif source_oper.move(
+                            fileitem, Path(target_fileitem.path), target_file.name
+                    ):
+                        return __get_remote_targetitem(fileitem, target_file), ""
+                    return None, f"【{target_storage}】{fileitem.path} 移动文件失败"
                 else:
-                    return None, f"【{target_storage}】{target_file.parent} 目录获取失败"
+                    return (
+                        None,
+                        f"【{target_storage}】{target_file.parent} 目录获取失败",
+                    )
             elif transfer_type == "link":
                 if source_oper.link(fileitem, target_file):
-                    return target_oper.get_item(target_file), ""
+                    return __get_remote_targetitem(fileitem, target_file), ""
                 else:
                     return None, f"【{target_storage}】{fileitem.path} 创建硬链接失败"
             else:
@@ -497,18 +835,29 @@ class TransHandler:
         重命名字幕文件，补充附加信息
         """
         # 字幕正则式
-        _zhcn_sub_re = r"([.\[(](((zh[-_])?(cn|ch[si]|sg|sc))|zho?" \
-                       r"|chinese|(cn|ch[si]|sg|zho?|eng)[-_&]?(cn|ch[si]|sg|zho?|eng)" \
-                       r"|简[体中]?)[.\])])" \
-                       r"|([\u4e00-\u9fa5]{0,3}[中双][\u4e00-\u9fa5]{0,2}[字文语][\u4e00-\u9fa5]{0,3})" \
-                       r"|简体|简中|JPSC|sc_jp" \
-                       r"|(?<![a-z0-9])gb(?![a-z0-9])"
-        _zhtw_sub_re = r"([.\[(](((zh[-_])?(hk|tw|cht|tc))" \
-                       r"|(cht|eng)[-_&]?(cht|eng)" \
-                       r"|繁[体中]?)[.\])])" \
-                       r"|繁体中[文字]|中[文字]繁体|繁体|JPTC|tc_jp" \
-                       r"|(?<![a-z0-9])big5(?![a-z0-9])"
-        _eng_sub_re = r"[.\[(]eng[.\])]"
+        _zhcn_sub_re = (
+            r"([.\[(\s](((zh[-_])?(cn|ch[si]|sg|sc))|zho?"
+            r"|chinese|(cn|ch[si]|sg|zho?)[-_&]?(cn|ch[si]|sg|zho?|eng|jap|ja|jpn)"
+            r"|eng[-_&]?(cn|ch[si]|sg|zho?)|(jap|ja|jpn)[-_&]?(cn|ch[si]|sg|zho?)"
+            r"|简[体中]?)[.\])\s])"
+            r"|([\u4e00-\u9fa5]{0,3}[中双][\u4e00-\u9fa5]{0,2}[字文语][\u4e00-\u9fa5]{0,3})"
+            r"|简体|简中|JPSC|sc_jp"
+            r"|(?<![a-z0-9])gb(?![a-z0-9])"
+        )
+        _zhtw_sub_re = (
+            r"([.\[(\s](((zh[-_])?(hk|tw|cht|tc))"
+            r"|cht[-_&]?(cht|eng|jap|ja|jpn)"
+            r"|eng[-_&]?cht|(jap|ja|jpn)[-_&]?cht"
+            r"|繁[体中]?)[.\])\s])"
+            r"|繁体中[文字]|中[文字]繁体|繁体|JPTC|tc_jp"
+            r"|(?<![a-z0-9])big5(?![a-z0-9])"
+        )
+        _ja_sub_re = (
+            r"([.\[(\s](ja-jp|jap|ja|jpn"
+            r"|(jap|ja|jpn)[-_&]?eng|eng[-_&]?(jap|ja|jpn))[.\])\s])"
+            r"|日本語|日語"
+        )
+        _eng_sub_re = r"[.\[(\s]eng[.\])\s]"
 
         # 原文件后缀
         file_ext = f".{sub_item.extension}"
@@ -516,27 +865,40 @@ class TransHandler:
         new_file_type = ""
 
         # 识别字幕语言
-        if re.search(_zhcn_sub_re, sub_item.name, re.I):
-            new_file_type = ".chi.zh-cn"
-        elif re.search(_zhtw_sub_re, sub_item.name, re.I):
+        # 先识别繁中，避免“繁体中文/繁中字”等名称被后面的“中文/中字”简中兜底规则误判。
+        if re.search(_zhtw_sub_re, sub_item.name, re.I):
             new_file_type = ".zh-tw"
+        elif re.search(_zhcn_sub_re, sub_item.name, re.I):
+            new_file_type = ".chi.zh-cn"
+        elif re.search(_ja_sub_re, sub_item.name, re.I):
+            new_file_type = ".ja"
         elif re.search(_eng_sub_re, sub_item.name, re.I):
             new_file_type = ".eng"
 
         # 添加默认字幕标识
-        if ((settings.DEFAULT_SUB == "zh-cn" and new_file_type == ".chi.zh-cn")
-                or (settings.DEFAULT_SUB == "zh-tw" and new_file_type == ".zh-tw")
-                or (settings.DEFAULT_SUB == "eng" and new_file_type == ".eng")):
+        if (
+            (settings.DEFAULT_SUB == "zh-cn" and new_file_type == ".chi.zh-cn")
+            or (settings.DEFAULT_SUB == "zh-tw" and new_file_type == ".zh-tw")
+            or (settings.DEFAULT_SUB == "ja" and new_file_type == ".ja")
+            or (settings.DEFAULT_SUB == "eng" and new_file_type == ".eng")
+        ):
             new_sub_tag = ".default" + new_file_type
         else:
             new_sub_tag = new_file_type
 
         return new_file.with_name(new_file.stem + new_sub_tag + file_ext)
 
-    def __transfer_dir(self, fileitem: FileItem, mediainfo: MediaInfo,
-                       source_oper: StorageBase, target_oper: StorageBase,
-                       transfer_type: str, target_storage: str, target_path: Path,
-                       result: TransferInfo) -> Tuple[Optional[FileItem], str]:
+    def __transfer_dir(
+        self,
+        fileitem: FileItem,
+        mediainfo: MediaInfo,
+        source_oper: StorageBase,
+        target_oper: StorageBase,
+        transfer_type: str,
+        target_storage: str,
+        target_path: Path,
+        result: TransferInfo,
+    ) -> Tuple[Optional[FileItem], str]:
         """
         整理整个文件夹
         :param fileitem: 源文件
@@ -556,7 +918,7 @@ class TransHandler:
             mediainfo=mediainfo,
             target_storage=target_storage,
             target_path=target_path,
-            transfer_type=transfer_type
+            transfer_type=transfer_type,
         )
         event = eventmanager.send_event(ChainEventType.TransferIntercept, event_data)
         if event and event.event_data:
@@ -565,25 +927,34 @@ class TransHandler:
             if event_data.cancel:
                 logger.debug(
                     f"Transfer dir canceled by event: {event_data.source},"
-                    f"Reason: {event_data.reason}")
+                    f"Reason: {event_data.reason}"
+                )
                 return None, event_data.reason
         # 处理所有文件
-        state, errmsg = self.__transfer_dir_files(fileitem=fileitem,
-                                                  target_storage=target_storage,
-                                                  source_oper=source_oper,
-                                                  target_oper=target_oper,
-                                                  target_path=target_path,
-                                                  transfer_type=transfer_type,
-                                                  result=result)
+        state, errmsg = self.__transfer_dir_files(
+            fileitem=fileitem,
+            target_storage=target_storage,
+            source_oper=source_oper,
+            target_oper=target_oper,
+            target_path=target_path,
+            transfer_type=transfer_type,
+            result=result,
+        )
         if state:
             return target_item, errmsg
         else:
             return None, errmsg
 
-    def __transfer_dir_files(self, fileitem: FileItem, target_storage: str,
-                             source_oper: StorageBase, target_oper: StorageBase,
-                             transfer_type: str, target_path: Path,
-                             result: TransferInfo) -> Tuple[bool, str]:
+    def __transfer_dir_files(
+        self,
+        fileitem: FileItem,
+        target_storage: str,
+        source_oper: StorageBase,
+        target_oper: StorageBase,
+        transfer_type: str,
+        target_path: Path,
+        result: TransferInfo,
+    ) -> Tuple[bool, str]:
         """
         按目录结构整理目录下所有文件
         :param fileitem: 源文件
@@ -599,24 +970,28 @@ class TransHandler:
             if item.type == "dir":
                 # 递归整理目录
                 new_path = target_path / item.name
-                state, errmsg = self.__transfer_dir_files(fileitem=item,
-                                                          target_storage=target_storage,
-                                                          source_oper=source_oper,
-                                                          target_oper=target_oper,
-                                                          transfer_type=transfer_type,
-                                                          target_path=new_path,
-                                                          result=result)
+                state, errmsg = self.__transfer_dir_files(
+                    fileitem=item,
+                    target_storage=target_storage,
+                    source_oper=source_oper,
+                    target_oper=target_oper,
+                    transfer_type=transfer_type,
+                    target_path=new_path,
+                    result=result,
+                )
                 if not state:
                     return False, errmsg
             else:
                 # 整理文件
                 new_file = target_path / item.name
-                new_item, errmsg = self.__transfer_command(fileitem=item,
-                                                           target_storage=target_storage,
-                                                           source_oper=source_oper,
-                                                           target_oper=target_oper,
-                                                           target_file=new_file,
-                                                           transfer_type=transfer_type)
+                new_item, errmsg = self.__transfer_command(
+                    fileitem=item,
+                    target_storage=target_storage,
+                    source_oper=source_oper,
+                    target_oper=target_oper,
+                    target_file=new_file,
+                    transfer_type=transfer_type,
+                )
                 if not new_item:
                     return False, errmsg
                 self.__update_result(
@@ -627,14 +1002,23 @@ class TransHandler:
         # 返回成功
         return True, ""
 
-    def __transfer_file(self, fileitem: FileItem, mediainfo: MediaInfo,
-                        source_oper: StorageBase, target_oper: StorageBase,
-                        target_storage: str, target_file: Path,
-                        transfer_type: str, result: TransferInfo,
-                        over_flag: Optional[bool] = False) -> Tuple[Optional[FileItem], str]:
+    def __transfer_file(
+        self,
+        fileitem: FileItem,
+        meta: Optional[MetaBase],
+        mediainfo: MediaInfo,
+        source_oper: StorageBase,
+        target_oper: StorageBase,
+        target_storage: str,
+        target_file: Path,
+        transfer_type: str,
+        result: TransferInfo,
+        over_flag: Optional[bool] = False,
+    ) -> Tuple[Optional[FileItem], str]:
         """
         整理一个文件，同时处理其他相关文件
         :param fileitem: 原文件
+        :param meta: 元数据
         :param mediainfo: 媒体信息
         :param source_oper: 源存储操作对象
         :param target_oper: 目标存储操作对象
@@ -645,17 +1029,18 @@ class TransHandler:
         :param source_oper: 源存储操作对象
         :param target_oper: 目标存储操作对象
         """
-        logger.info(f"正在整理文件：【{fileitem.storage}】{fileitem.path} 到 【{target_storage}】{target_file}，"
-                    f"操作类型：{transfer_type}")
+        logger.info(
+            f"正在整理文件：【{fileitem.storage}】{fileitem.path} 到 【{target_storage}】{target_file}，"
+            f"操作类型：{transfer_type}"
+        )
         event_data = TransferInterceptEventData(
             fileitem=fileitem,
+            meta=meta,
             mediainfo=mediainfo,
             target_storage=target_storage,
             target_path=target_file,
             transfer_type=transfer_type,
-            options={
-                "over_flag": over_flag
-            }
+            options={"over_flag": over_flag},
         )
         event = eventmanager.send_event(ChainEventType.TransferIntercept, event_data)
         if event and event.event_data:
@@ -664,9 +1049,12 @@ class TransHandler:
             if event_data.cancel:
                 logger.debug(
                     f"Transfer file canceled by event: {event_data.source},"
-                    f"Reason: {event_data.reason}")
+                    f"Reason: {event_data.reason}"
+                )
                 return None, event_data.reason
-        if target_storage == "local" and (target_file.exists() or target_file.is_symlink()):
+        if target_storage == "local" and (
+            target_file.exists() or target_file.is_symlink()
+        ):
             if not over_flag:
                 logger.warn(f"文件已存在：{target_file}")
                 return None, f"{target_file} 已存在"
@@ -680,15 +1068,19 @@ class TransHandler:
                     logger.warn(f"文件已存在：【{target_storage}】{target_file}")
                     return None, f"【{target_storage}】{target_file} 已存在"
                 else:
-                    logger.info(f"正在删除已存在的文件：【{target_storage}】{target_file}")
+                    logger.info(
+                        f"正在删除已存在的文件：【{target_storage}】{target_file}"
+                    )
                     target_oper.delete(exists_item)
         # 执行文件整理命令
-        new_item, errmsg = self.__transfer_command(fileitem=fileitem,
-                                                   target_storage=target_storage,
-                                                   source_oper=source_oper,
-                                                   target_oper=target_oper,
-                                                   target_file=target_file,
-                                                   transfer_type=transfer_type)
+        new_item, errmsg = self.__transfer_command(
+            fileitem=fileitem,
+            target_storage=target_storage,
+            source_oper=source_oper,
+            target_oper=target_oper,
+            target_file=target_file,
+            transfer_type=transfer_type,
+        )
         if new_item:
             self.__update_result(
                 result=result,
@@ -702,8 +1094,12 @@ class TransHandler:
         return None, errmsg
 
     @staticmethod
-    def get_dest_path(mediainfo: MediaInfo, target_path: Path,
-                      need_type_folder: Optional[bool] = False, need_category_folder: Optional[bool] = False):
+    def get_dest_path(
+        mediainfo: MediaInfo,
+        target_path: Path,
+        need_type_folder: Optional[bool] = False,
+        need_category_folder: Optional[bool] = False,
+    ):
         """
         获取目标路径
         """
@@ -714,8 +1110,12 @@ class TransHandler:
         return target_path
 
     @staticmethod
-    def get_dest_dir(mediainfo: MediaInfo, target_dir: TransferDirectoryConf,
-                     need_type_folder: Optional[bool] = None, need_category_folder: Optional[bool] = None) -> Path:
+    def get_dest_dir(
+        mediainfo: MediaInfo,
+        target_dir: TransferDirectoryConf,
+        need_type_folder: Optional[bool] = None,
+        need_category_folder: Optional[bool] = None,
+    ) -> Path:
         """
         根据设置并装媒体库目录
         :param mediainfo: 媒体信息
@@ -735,7 +1135,11 @@ class TransHandler:
             library_dir = Path(target_dir.library_path) / target_dir.media_type
         else:
             library_dir = Path(target_dir.library_path)
-        if not target_dir.media_category and need_category_folder and mediainfo.category:
+        if (
+            not target_dir.media_category
+            and need_category_folder
+            and mediainfo.category
+        ):
             # 二级自动分类
             library_dir = library_dir / mediainfo.category
         elif target_dir.media_category and need_category_folder:
@@ -745,8 +1149,12 @@ class TransHandler:
         return library_dir
 
     @staticmethod
-    def get_naming_dict(meta: MetaBase, mediainfo: MediaInfo, file_ext: Optional[str] = None,
-                        episodes_info: List[TmdbEpisode] = None) -> dict:
+    def get_naming_dict(
+        meta: MetaBase,
+        mediainfo: MediaInfo,
+        file_ext: Optional[str] = None,
+        episodes_info: List[TmdbEpisode] = None,
+    ) -> dict:
         """
         根据媒体信息，返回Format字典
         :param meta: 文件元数据
@@ -754,8 +1162,12 @@ class TransHandler:
         :param file_ext: 文件扩展名
         :param episodes_info: 当前季的全部集信息
         """
-        return TemplateHelper().builder.build(meta=meta, mediainfo=mediainfo,
-                                              file_extension=file_ext, episodes_info=episodes_info)
+        return TemplateHelper().builder.build(
+            meta=meta,
+            mediainfo=mediainfo,
+            file_extension=file_ext,
+            episodes_info=episodes_info,
+        )
 
     @staticmethod
     def __delete_version_files(storage_oper: StorageBase, path: Path) -> bool:
@@ -771,6 +1183,7 @@ class TransHandler:
         meta = MetaInfoPath(path)
         season = meta.season
         episode = meta.episode
+        part = meta.part
         logger.warn(f"正在删除目标目录中其它版本的文件：{path.parent}")
         # 获取父目录
         parent_item = storage_oper.get_item(path.parent)
@@ -789,27 +1202,51 @@ class TransHandler:
                 continue
             if media_file.type != "file":
                 continue
-            media_exts = settings.RMT_MEDIAEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
-            if f".{media_file.extension.lower()}" not in media_exts:
+            # 当前只有视频文件需要保留最新版本，其余格式无需处理，以避免误删 (issue 5449)
+            if f".{media_file.extension.lower()}" not in settings.RMT_MEDIAEXT:
                 continue
             # 识别文件中的季集信息
             filemeta = MetaInfoPath(media_path)
             # 相同季集的文件才删除
             if filemeta.season != season or filemeta.episode != episode:
                 continue
+            # 相同 Part 的文件才删除，避免误删多 Part 文件 (issue #5862)
+            if part and filemeta.part and filemeta.part != part:
+                continue
             logger.info(f"正在删除文件：{media_file.name}")
             storage_oper.delete(media_file)
         return True
 
     @staticmethod
-    def get_rename_path(template_string: str, rename_dict: dict, path: Path = None) -> Path:
+    def get_rename_path(
+        template_string: str,
+        rename_dict: dict,
+        path: Optional[Path] = None,
+        source_path: Optional[str] = None,
+        source_item: Optional[FileItem] = None,
+    ) -> Path:
         """
         生成重命名后的完整路径，支持智能重命名事件
         :param template_string: Jinja2 模板字符串
         :param rename_dict: 渲染上下文，用于替换模板中的变量
         :param path: 可选的基础路径，如果提供，将在其基础上拼接生成的路径
+        :param source_path: 源文件路径，即待整理的文件路径
+        :param source_item: 源文件信息，即待整理的文件信息
         :return: 生成的完整路径
         """
+        # 渲染前先发事件，让插件有机会往 rename_dict 写字段
+        build_event_data = TransferRenameBuildEventData(
+            template_string=template_string,
+            rename_dict=rename_dict,
+            source_path=source_path,
+            source_item=source_item,
+        )
+        build_event = eventmanager.send_event(
+            ChainEventType.TransferRenameBuild, build_event_data
+        )
+        if build_event and build_event.event_data:
+            rename_dict = build_event.event_data.rename_dict
+
         # 创建jinja2模板对象
         template = Template(template_string)
         # 渲染生成的字符串
@@ -821,15 +1258,19 @@ class TransHandler:
             template_string=template_string,
             rename_dict=rename_dict,
             render_str=render_str,
-            path=path
+            path=path,
+            source_path=source_path,
+            source_item=source_item,
         )
         event = eventmanager.send_event(ChainEventType.TransferRename, event_data)
         # 检查事件返回的结果
         if event and event.event_data:
             event_data: TransferRenameEventData = event.event_data
             if event_data.updated and event_data.updated_str:
-                logger.debug(f"Render string updated by event: "
-                             f"{render_str} -> {event_data.updated_str} (source: {event_data.source})")
+                logger.debug(
+                    f"Render string updated by event: "
+                    f"{render_str} -> {event_data.updated_str} (source: {event_data.source})"
+                )
                 render_str = event_data.updated_str
 
         # 目的路径

@@ -1,7 +1,9 @@
+import re
 import shutil
 import time
 from pathlib import Path
-from typing import Tuple, Union
+from typing import List, Optional, Tuple, Union
+from urllib.parse import urljoin, urlparse
 
 from lxml import etree
 
@@ -18,7 +20,6 @@ from app.schemas import TorrentInfo
 from app.schemas.file import FileURI 
 from app.schemas.types import ModuleType, OtherModulesType
 from app.utils.http import RequestUtils
-from app.utils.string import StringUtils
 from app.utils.system import SystemUtils
 
 
@@ -27,12 +28,29 @@ class SubtitleModule(_ModuleBase):
     字幕下载模块
     """
 
-    # 站点详情页字幕下载链接识别XPATH
+    _SUBTITLE_ARCHIVE_FORMATS = {
+        ".zip": "zip",
+        ".rar": "rar",
+    }
+
+    # 站点详情页字幕下载元素识别XPATH
     _SITE_SUBTITLE_XPATH = [
-        '//td[@class="rowhead"][text()="字幕"]/following-sibling::td//a[not(@class)]/@href',
-        '//td[@class="rowhead"][text()="字幕"]/following-sibling::td//a/@href',
-        '//div[contains(@class, "font-bold")][text()="字幕"]/following-sibling::div[1]//a[not(@class)]/@href', # 憨憨
+        '//td[@class="rowhead"][text()="字幕"]/following-sibling::td//a[not(@class)]',
+        '//td[@class="rowhead"][text()="字幕"]/following-sibling::td//a',
+        '//div[contains(@class, "font-bold")][text()="字幕"]/following-sibling::div[1]//a[not(@class)]', # 憨憨
     ]
+    _SUBTITLE_URL_ATTRS = (
+        "href",
+        "data-url",
+        "data-href",
+        "data-link",
+        "data-download",
+        "data-download-url",
+    )
+    _SCRIPT_URL_RE = re.compile(
+        r"""["'](?P<url>(?:https?:)?//[^"']+|/[^"']+|[^"']*(?:download|subtitle|subs?)[^"']*)["']""",
+        re.IGNORECASE,
+    )
 
     def init_module(self) -> None:
         pass
@@ -71,6 +89,57 @@ class SubtitleModule(_ModuleBase):
     def test(self):
         pass
 
+    @classmethod
+    def __normalize_subtitle_link(cls, page_url: str, sublink: str) -> Optional[str]:
+        """
+        转换并过滤真实字幕下载链接
+        """
+        if not sublink:
+            return None
+        sublink = sublink.strip()
+        if not sublink or sublink.startswith("#"):
+            return None
+        parsed = urlparse(sublink)
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            return None
+        if sublink.startswith("//"):
+            page_scheme = urlparse(page_url).scheme or "https"
+            sublink = f"{page_scheme}:{sublink}"
+        else:
+            sublink = urljoin(page_url, sublink)
+        parsed = urlparse(sublink)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+        return sublink
+
+    @classmethod
+    def _parse_subtitle_links(cls, html, page_url: str) -> List[str]:
+        """
+        从站点详情页中解析字幕下载链接
+        """
+        sublink_list = []
+        found_links = set()
+        for xpath in cls._SITE_SUBTITLE_XPATH:
+            sublink_count = len(sublink_list)
+            sublink_nodes = html.xpath(xpath)
+            if sublink_nodes:
+                for sublink_node in sublink_nodes:
+                    sublinks = [sublink_node.get(attr) for attr in cls._SUBTITLE_URL_ATTRS]
+                    sublinks.extend(
+                        match.group("url")
+                        for match in cls._SCRIPT_URL_RE.finditer(sublink_node.get("onclick") or "")
+                    )
+                    for sublink in sublinks:
+                        sublink = cls.__normalize_subtitle_link(page_url, sublink)
+                        if not sublink or sublink in found_links:
+                            continue
+                        found_links.add(sublink)
+                        sublink_list.append(sublink)
+                # 已成功匹配字幕区域，后续xpath可以忽略
+                if len(sublink_list) > sublink_count:
+                    break
+        return sublink_list
+
     def _get_subtitle_links(self, torrent: TorrentInfo):
         """
         获取字幕链接
@@ -97,23 +166,7 @@ class SubtitleModule(_ModuleBase):
                 return []
             html = etree.HTML(res.text)
             try:
-                sublink_list = []
-                for xpath in self._SITE_SUBTITLE_XPATH:
-                    sublinks = html.xpath(xpath)
-                    if sublinks:
-                        for sublink in sublinks:
-                            if not sublink:
-                                continue
-                            if not sublink.startswith("http"):
-                                base_url = StringUtils.get_base_url(torrent.page_url)
-                                if sublink.startswith("/"):
-                                    sublink = "%s%s" % (base_url, sublink)
-                                else:
-                                    sublink = "%s/%s" % (base_url, sublink)
-                            sublink_list.append(sublink)
-                        # 已成功获取了链接，后续xpath可以忽略
-                        break
-                return sublink_list
+                return self._parse_subtitle_links(html, torrent.page_url)
             finally:
                 if html is not None:
                     del html
@@ -162,7 +215,7 @@ class SubtitleModule(_ModuleBase):
             time.sleep(1)
         # 目录仍然不存在，且有文件夹名，则创建目录
         if not working_dir_item and folder_name:
-            parent_dir_item = storageChain.get_file_item(storage, download_dir)
+            parent_dir_item = storageChain.get_folder(storage, download_dir)
             if parent_dir_item:
                 working_dir_item = storageChain.create_folder(
                     parent_dir_item,
@@ -185,40 +238,52 @@ class SubtitleModule(_ModuleBase):
             ua=torrent.site_ua,
             proxies=settings.PROXY if torrent.site_proxy else None,
         )
+        settings.TEMP_PATH.mkdir(parents=True, exist_ok=True)
         for sublink in sublink_list:
             logger.info(f"找到字幕下载链接：{sublink}，开始下载...")
             # 下载
             ret = request.get_res(sublink)
             if ret and ret.status_code == 200:
-                # 保存ZIP
                 file_name = TorrentHelper.get_url_filename(ret, sublink)
                 if not file_name:
                     logger.warn(f"链接不是字幕文件：{sublink}")
                     continue
-                if file_name.lower().endswith(".zip"):
-                    # ZIP包
-                    zip_file = settings.TEMP_PATH / file_name
+                archive_format = self._SUBTITLE_ARCHIVE_FORMATS.get(Path(file_name).suffix.lower())
+                if archive_format:
+                    archive_file = settings.TEMP_PATH / file_name
                     # 保存
-                    zip_file.write_bytes(ret.content)
+                    archive_file.write_bytes(ret.content)
                     # 解压路径
-                    zip_path = zip_file.with_name(zip_file.stem)
-                    # 解压文件
-                    shutil.unpack_archive(zip_file, zip_path, format='zip')
-                    # 遍历转移文件
-                    for sub_file in SystemUtils.list_files(zip_path, settings.RMT_SUBEXT):
-                        target_sub_file = Path(working_dir_item.path) / Path(sub_file.name)
-                        if storageChain.get_file_item(storage, target_sub_file):
-                            logger.info(f"字幕文件已存在：{target_sub_file}")
-                            continue
-                        logger.info(f"转移字幕 {sub_file} 到 {target_sub_file} ...")
-                        storageChain.upload_file(working_dir_item, sub_file)
+                    archive_path = archive_file.with_name(archive_file.stem)
+                    try:
+                        # 解压文件
+                        SystemUtils.unpack_archive(
+                            archive_file,
+                            archive_path,
+                            archive_format=archive_format,
+                        )
+                        # 遍历转移文件
+                        for sub_file in SystemUtils.list_files(archive_path, settings.RMT_SUBEXT):
+                            target_sub_file = Path(working_dir_item.path) / Path(sub_file.name)
+                            if storageChain.get_file_item(storage, target_sub_file):
+                                logger.info(f"字幕文件已存在：{target_sub_file}")
+                                continue
+                            logger.info(f"转移字幕 {sub_file} 到 {target_sub_file} ...")
+                            storageChain.upload_file(working_dir_item, sub_file)
+                    except Exception as err:
+                        logger.error(f"字幕压缩包解压失败：{archive_file} - {str(err)}")
                     # 删除临时文件
                     try:
-                        shutil.rmtree(zip_path)
-                        zip_file.unlink()
+                        if archive_path.exists():
+                            shutil.rmtree(archive_path)
+                        if archive_file.exists():
+                            archive_file.unlink()
                     except Exception as err:
                         logger.error(f"删除临时文件失败：{str(err)}")
                 else:
+                    if Path(file_name).suffix.lower() not in settings.RMT_SUBEXT:
+                        logger.warn(f"链接不是支持的字幕文件：{sublink} - {file_name}")
+                        continue
                     sub_file = settings.TEMP_PATH / file_name
                     # 保存
                     sub_file.write_bytes(ret.content)

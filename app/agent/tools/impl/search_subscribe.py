@@ -6,23 +6,29 @@ from typing import Optional, Type, List
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.subscribe import SubscribeChain
-from app.core.config import global_vars
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
+from app.schemas.types import media_type_to_agent
 
 
 class SearchSubscribeInput(BaseModel):
     """搜索订阅缺失剧集工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-    subscribe_id: int = Field(..., description="The ID of the subscription to search for missing episodes")
+    subscribe_id: int = Field(..., description="The ID of the subscription to search for missing episodes (can be obtained from query_subscribes tool)")
     manual: Optional[bool] = Field(False, description="Whether this is a manual search (default: False)")
     filter_groups: Optional[List[str]] = Field(None,
-                                               description="List of filter rule group names to apply for this search (optional, use query_rule_groups tool to get available rule groups. If provided, will temporarily update the subscription's filter groups before searching)")
+                                               description="List of filter rule group names to apply for this search (optional, can be obtained from query_rule_groups tool. If provided, will temporarily update the subscription's filter groups before searching)")
 
 
 class SearchSubscribeTool(MoviePilotTool):
     name: str = "search_subscribe"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Write,
+        ToolTag.Subscription,
+        ToolTag.Resource,
+    ]
     description: str = "Search for missing episodes/resources for a specific subscription. This tool will search torrent sites for the missing episodes of the subscription and automatically download matching resources. Use this when a user wants to search for missing episodes of a specific subscription."
     args_schema: Type[BaseModel] = SearchSubscribeInput
 
@@ -31,7 +37,7 @@ class SearchSubscribeTool(MoviePilotTool):
         subscribe_id = kwargs.get("subscribe_id")
         manual = kwargs.get("manual", False)
 
-        message = f"正在搜索订阅 #{subscribe_id} 的缺失剧集"
+        message = f"搜索订阅 #{subscribe_id} 的缺失剧集"
         if manual:
             message += "（手动搜索）"
 
@@ -58,13 +64,17 @@ class SearchSubscribeTool(MoviePilotTool):
                 "id": subscribe.id,
                 "name": subscribe.name,
                 "year": subscribe.year,
-                "type": subscribe.type,
+                "type": media_type_to_agent(subscribe.type),
                 "season": subscribe.season,
                 "state": subscribe.state,
                 "total_episode": subscribe.total_episode,
                 "lack_episode": subscribe.lack_episode,
                 "tmdbid": subscribe.tmdbid,
-                "doubanid": subscribe.doubanid
+                "doubanid": subscribe.doubanid,
+                "bangumiid": subscribe.bangumiid,
+                "anilistid": subscribe.anilistid,
+                "media_source": subscribe.media_source,
+                "media_id": subscribe.media_id,
             }
 
             # 检查订阅状态
@@ -80,19 +90,13 @@ class SearchSubscribeTool(MoviePilotTool):
                 subscribe_oper.update(subscribe_id, {"filter_groups": filter_groups})
                 logger.info(f"更新订阅 #{subscribe_id} 的规则组为: {filter_groups}")
 
-            # 调用 SubscribeChain 的 search 方法
-            # search 方法是同步的，需要在异步环境中运行
-            subscribe_chain = SubscribeChain()
-
-            # 在线程池中执行同步的搜索操作
-            # 当 sid 有值时，state 参数会被忽略，直接处理该订阅
-            await global_vars.loop.run_in_executor(
-                None,
-                lambda: subscribe_chain.search(
-                    sid=subscribe_id,
-                    state='R',  # 默认状态，当 sid 有值时此参数会被忽略
-                    manual=manual
-                )
+            # 订阅搜索会触发大量同步站点访问，统一走 subscribe 线程池。
+            await self.run_blocking(
+                "subscribe",
+                SubscribeChain().search,
+                sid=subscribe_id,
+                state="R",  # 当 sid 有值时此参数会被忽略
+                manual=manual,
             )
 
             # 重新获取订阅信息以获取更新后的状态

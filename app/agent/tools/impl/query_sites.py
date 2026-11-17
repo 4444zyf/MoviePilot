@@ -6,43 +6,58 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.db.site_oper import SiteOper
 from app.log import logger
 
 
 class QuerySitesInput(BaseModel):
     """查询站点工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-    status: Optional[str] = Field("all",
-                                  description="Filter sites by status: 'active' for enabled sites, 'inactive' for disabled sites, 'all' for all sites")
-    name: Optional[str] = Field(None,
-                                description="Filter sites by name (partial match, optional)")
+
+    status: Optional[str] = Field(
+        "all",
+        description="Filter sites by status: 'active' for enabled sites, 'inactive' for disabled sites, 'all' for all sites",
+    )
+    name: Optional[str] = Field(
+        None, description="Filter sites by name (partial match, optional)"
+    )
 
 
 class QuerySitesTool(MoviePilotTool):
     name: str = "query_sites"
-    description: str = "Query site status and list all configured sites. Shows site name, domain, status, priority, and basic configuration. Site priority (pri): smaller values have higher priority (e.g., pri=1 has higher priority than pri=10)."
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Site,
+    ]
+    description: str = (
+        "Query site status and list configured sites. Non-admin users receive a safe view "
+        "that omits sensitive fields: cookie, token, API key and RSS URL. "
+        "Site priority (pri): smaller values have higher priority (e.g., pri=1 has higher priority than pri=10)."
+    )
     args_schema: Type[BaseModel] = QuerySitesInput
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         """根据查询参数生成友好的提示消息"""
         status = kwargs.get("status", "all")
         name = kwargs.get("name")
-        
-        parts = ["正在查询站点"]
-        
+
+        parts = ["查询站点"]
+
         if status != "all":
             status_map = {"active": "已启用", "inactive": "已禁用"}
             parts.append(f"状态: {status_map.get(status, status)}")
-        
+
         if name:
             parts.append(f"名称: {name}")
-        
+
         return " | ".join(parts) if len(parts) > 1 else parts[0]
 
-    async def run(self, status: Optional[str] = "all", name: Optional[str] = None, **kwargs) -> str:
+    async def run(
+        self, status: Optional[str] = "all", name: Optional[str] = None, **kwargs
+    ) -> str:
         logger.info(f"执行工具: {self.name}, 参数: status={status}, name={name}")
         try:
+            is_admin = await self.is_admin_user()
             site_oper = SiteOper()
             # 获取所有站点（按优先级排序）
             sites = await site_oper.async_list()
@@ -69,9 +84,24 @@ class QuerySitesTool(MoviePilotTool):
                         "pri": s.pri,
                         "is_active": s.is_active,
                         "downloader": s.downloader,
+                        "ua": s.ua,
                         "proxy": s.proxy,
-                        "timeout": s.timeout
+                        "filter": s.filter,
+                        "render": s.render,
+                        "public": s.public,
+                        "note": s.note,
+                        "limit_interval": s.limit_interval,
+                        "limit_count": s.limit_count,
+                        "limit_seconds": s.limit_seconds,
+                        "timeout": s.timeout,
                     }
+                    if is_admin:
+                        simplified.update({
+                            "rss": s.rss,
+                            "cookie": s.cookie,
+                            "apikey": s.apikey,
+                            "token": s.token,
+                        })
                     simplified_sites.append(simplified)
                 result_json = json.dumps(simplified_sites, ensure_ascii=False, indent=2)
                 return result_json
@@ -79,4 +109,3 @@ class QuerySitesTool(MoviePilotTool):
         except Exception as e:
             logger.error(f"查询站点失败: {e}", exc_info=True)
             return f"查询站点时发生错误: {str(e)}"
-

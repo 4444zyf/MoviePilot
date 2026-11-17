@@ -1,4 +1,4 @@
-FROM python:3.12.8-slim-bookworm AS base
+FROM python:3.12.13-slim-bookworm AS base
 
 
 # 准备软件包
@@ -24,17 +24,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     gosu \
     bash \
+    ca-certificates \
     curl \
     wget \
+    git \
+    gh \
     busybox \
-    dumb-init \
+    tini \
+    cron \
     jq \
+    ripgrep \
+    less \
+    unzip \
     fuse3 \
     rsync \
-    ffmpeg \
+    openssh-client \
+    sshpass \
+    iproute2 \
+    netcat-openbsd \
+    lsof \
     nano \
+    unar \
+    libjemalloc2 \
     && dpkg-reconfigure --frontend noninteractive tzdata \
     && curl https://rclone.org/install.sh | bash \
+    && ln -s /usr/lib/*-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf \
@@ -64,10 +78,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 安装 Python 构建依赖并创建虚拟环境
 WORKDIR /app
 COPY requirements.in requirements.in
+COPY scripts/uv-pip-compat.sh /usr/local/bin/uv-pip-compat
 RUN python3 -m venv ${VENV_PATH} \
-    && pip install --upgrade "pip<25.0" \
-    && pip install "Cython" "pip-tools<7.5" \
-    && pip-compile requirements.in \
+    && env UV_INSTALL_DIR=/usr/local/bin sh -c "$(curl -LsSf https://astral.sh/uv/install.sh)" \
+    && chmod +x /usr/local/bin/uv-pip-compat \
+    && ln -sf /usr/local/bin/uv ${VENV_PATH}/bin/uv \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip3 \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip3.12 \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip-compile \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip-sync \
+    && pip-compile requirements.in -o requirements.txt \
     && pip install -r requirements.txt
 
 # 下载准备代码
@@ -92,13 +113,20 @@ RUN FRONTEND_VERSION=$(sed -n "s/^FRONTEND_VERSION\s*=\s*'\([^']*\)'/\1/p" /app/
 # final 阶段: 安装运行时依赖和配置最终镜像
 FROM prepare_package AS final
 
-# python 环境
-COPY --from=prepare_venv ${VENV_PATH} ${VENV_PATH}
-RUN chmod -R 777 ${VENV_PATH}
+ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so" \
+    MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE="true"
 
-# playwright 环境
+# 引入支持 amr 编码的静态 ffmpeg
+COPY --from=mwader/static-ffmpeg:8.1.1 /ffmpeg /usr/local/bin/
+COPY --from=mwader/static-ffmpeg:8.1.1 /ffprobe /usr/local/bin/
+
+# python 环境
+COPY --from=prepare_venv --chmod=777 ${VENV_PATH} ${VENV_PATH}
+COPY --from=prepare_venv /usr/local/bin/uv /usr/local/bin/uv
+COPY --from=prepare_venv /usr/local/bin/uv-pip-compat /usr/local/bin/uv-pip-compat
+
+# 浏览器运行依赖
 RUN playwright install-deps chromium \
-    && playwright install-deps firefox \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf \
@@ -117,7 +145,8 @@ RUN cp -f /app/docker/nginx.common.conf /etc/nginx/common.conf \
     && cp -f /app/docker/update.sh /usr/local/bin/mp_update.sh \
     && cp -f /app/docker/entrypoint.sh /entrypoint.sh \
     && cp -f /app/docker/docker_http_proxy.conf /etc/nginx/docker_http_proxy.conf \
-    && chmod +x /entrypoint.sh /usr/local/bin/mp_update.sh \
+    && printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd /app' 'exec "${VENV_PATH:-/opt/venv}/bin/python3" -m app.cli "$@"' > /usr/local/bin/moviepilot \
+    && chmod +x /entrypoint.sh /usr/local/bin/mp_update.sh /usr/local/bin/moviepilot \
     && mkdir -p ${HOME} \
     && groupadd -r moviepilot -g 918 \
     && useradd -r moviepilot -g moviepilot -d ${HOME} -s /bin/bash -u 918 \
@@ -125,8 +154,10 @@ RUN cp -f /app/docker/nginx.common.conf /etc/nginx/common.conf \
     && echo "/app/" > ${VENV_PATH}/lib/python${python_ver%.*}/site-packages/app.pth \
     && echo 'fs.inotify.max_user_watches=5242880' >> /etc/sysctl.conf \
     && echo 'fs.inotify.max_user_instances=5242880' >> /etc/sysctl.conf \
+    && echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen \
     && locale-gen zh_CN.UTF-8
 
 EXPOSE 3000
 VOLUME [ "${CONFIG_DIR}" ]
-ENTRYPOINT [ "/entrypoint.sh" ]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD curl -fsS "http://127.0.0.1:${PORT:-3001}/api/v1/system/global?token=moviepilot" >/dev/null || exit 1
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/entrypoint.sh" ]

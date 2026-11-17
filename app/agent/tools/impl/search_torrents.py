@@ -1,142 +1,134 @@
 """搜索种子工具"""
 
 import json
-import re
 from typing import List, Optional, Type
 
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.search import SearchChain
+from app.db.systemconfig_oper import SystemConfigOper
+from app.helper.sites import SitesHelper  # noqa
 from app.log import logger
-from app.schemas.types import MediaType
-from app.utils.string import StringUtils
+from app.schemas.types import MediaType, SystemConfigKey
+from ._torrent_search_utils import (
+    SEARCH_RESULT_CACHE_FILE,
+    build_filter_options,
+)
 
 
 class SearchTorrentsInput(BaseModel):
     """搜索种子工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-    title: str = Field(...,
-                       description="The title of the media resource to search for (e.g., 'The Matrix 1999', 'Breaking Bad S01E01')")
-    year: Optional[str] = Field(None,
-                                description="Release year of the media (optional, helps narrow down search results)")
-    media_type: Optional[str] = Field(None,
-                                      description="Type of media content: '电影' for films, '电视剧' for television series or anime series")
-    season: Optional[int] = Field(None, description="Season number for TV shows (optional, only applicable for series)")
+    tmdb_id: Optional[int] = Field(None, description="TMDB media ID")
+    douban_id: Optional[str] = Field(None, description="Douban media ID")
+    bangumi_id: Optional[int] = Field(None, description="Bangumi media ID")
+    anilist_id: Optional[int] = Field(None, description="AniList media ID")
+    media_source: Optional[str] = Field(None, description="Media metadata source")
+    media_id: Optional[str] = Field(None, description="Native ID for media_source")
+    media_type: Optional[str] = Field(None, description="Allowed values: movie, tv")
+    area: Optional[str] = Field(None, description="Search scope: 'title' (default) or 'imdbid'")
     sites: Optional[List[int]] = Field(None,
                                        description="Array of specific site IDs to search on (optional, if not provided searches all configured sites)")
-    filter_pattern: Optional[str] = Field(None,
-                                          description="Regular expression pattern to filter torrent titles by resolution, quality, or other keywords (e.g., '4K|2160p|UHD' for 4K content, '1080p|BluRay' for 1080p BluRay)")
 
 
 class SearchTorrentsTool(MoviePilotTool):
     name: str = "search_torrents"
-    description: str = "Search for torrent files across configured indexer sites based on media information. Returns available torrent downloads with details like file size, quality, and download links."
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Resource,
+        ToolTag.Site,
+        ToolTag.Media,
+    ]
+    description: str = (
+        "Search for torrent files by media ID across configured indexer sites, cache the matched results, "
+        "and return available filter options for follow-up selection. "
+        "Accepts a TMDB, Douban, Bangumi, AniList, or source-native media ID for accurate matching.")
     args_schema: Type[BaseModel] = SearchTorrentsInput
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         """根据搜索参数生成友好的提示消息"""
-        title = kwargs.get("title", "")
-        year = kwargs.get("year")
         media_type = kwargs.get("media_type")
-        season = kwargs.get("season")
-        filter_pattern = kwargs.get("filter_pattern")
-        
-        message = f"正在搜索种子: {title}"
-        if year:
-            message += f" ({year})"
+        identities = (
+            ("TMDB", kwargs.get("tmdb_id")),
+            ("豆瓣", kwargs.get("douban_id")),
+            ("Bangumi", kwargs.get("bangumi_id")),
+            ("AniList", kwargs.get("anilist_id")),
+            (kwargs.get("media_source") or "媒体源", kwargs.get("media_id")),
+        )
+        label, identity = next(
+            ((label, identity) for label, identity in identities if identity is not None),
+            (None, None),
+        )
+        message = f"搜索种子: {label}={identity}" if label else "搜索种子"
         if media_type:
             message += f" [{media_type}]"
-        if season:
-            message += f" 第{season}季"
-        if filter_pattern:
-            message += f" 过滤: {filter_pattern}"
-        
         return message
 
-    async def run(self, title: str, year: Optional[str] = None,
-                  media_type: Optional[str] = None, season: Optional[int] = None,
-                  sites: Optional[List[int]] = None, filter_pattern: Optional[str] = None, **kwargs) -> str:
+    @staticmethod
+    def _load_configured_sites() -> List[int]:
+        """同步读取默认搜索站点列表。"""
+        return SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
+
+    async def run(self, tmdb_id: Optional[int] = None, douban_id: Optional[str] = None,
+                  bangumi_id: Optional[int] = None, anilist_id: Optional[int] = None,
+                  media_source: Optional[str] = None, media_id: Optional[str] = None,
+                  media_type: Optional[str] = None, area: Optional[str] = None,
+                  sites: Optional[List[int]] = None, **kwargs) -> str:
         logger.info(
-            f"执行工具: {self.name}, 参数: title={title}, year={year}, media_type={media_type}, season={season}, sites={sites}, filter_pattern={filter_pattern}")
+            f"执行工具: {self.name}, 参数: tmdb_id={tmdb_id}, douban_id={douban_id}, media_type={media_type}, area={area}, sites={sites}")
+
+        if not any((tmdb_id, douban_id, bangumi_id, anilist_id, media_id)):
+            return "参数错误：至少需要提供一个媒体 ID，请先使用 search_media 工具获取媒体信息。"
 
         try:
             search_chain = SearchChain()
-            torrents = await search_chain.async_search_by_title(title=title, sites=sites)
-            filtered_torrents = []
-            # 编译正则表达式（如果提供）
-            regex_pattern = None
-            if filter_pattern:
-                try:
-                    regex_pattern = re.compile(filter_pattern, re.IGNORECASE)
-                except re.error as e:
-                    logger.warning(f"正则表达式编译失败: {filter_pattern}, 错误: {e}")
-                    return f"正则表达式格式错误: {str(e)}"
-            
-            for torrent in torrents:
-                # torrent 是 Context 对象，需要通过 meta_info 和 media_info 访问属性
-                if year and torrent.meta_info and torrent.meta_info.year != year:
-                    continue
-                if media_type and torrent.media_info:
-                    if torrent.media_info.type != MediaType(media_type):
-                        continue
-                if season and torrent.meta_info and torrent.meta_info.begin_season != season:
-                    continue
-                # 使用正则表达式过滤标题（分辨率、质量等关键字）
-                if regex_pattern and torrent.torrent_info and torrent.torrent_info.title:
-                    if not regex_pattern.search(torrent.torrent_info.title):
-                        continue
-                filtered_torrents.append(torrent)
+            media_type_enum = None
+            if media_type:
+                media_type_enum = MediaType.from_agent(media_type)
+                if not media_type_enum:
+                    return f"错误：无效的媒体类型 '{media_type}'，支持的类型：'movie', 'tv'"
+
+            filtered_torrents = await search_chain.async_search_by_id(
+                tmdbid=tmdb_id,
+                doubanid=douban_id,
+                bangumiid=bangumi_id,
+                anilistid=anilist_id,
+                source=media_source,
+                mediaid=media_id,
+                mtype=media_type_enum,
+                area=area or "title",
+                sites=sites,
+                cache_local=False,
+            )
+
+            # 获取站点信息
+            all_indexers = await SitesHelper().async_get_indexers()
+            all_sites = [{"id": indexer.get("id"), "name": indexer.get("name")} for indexer in (all_indexers or [])]
+
+            if sites:
+                search_site_ids = sites
+            else:
+                search_site_ids = self._load_configured_sites()
 
             if filtered_torrents:
-                # 限制最多50条结果
-                total_count = len(filtered_torrents)
-                limited_torrents = filtered_torrents[:50]
-                # 精简字段，只保留关键信息
-                simplified_torrents = []
-                for t in limited_torrents:
-                    simplified = {}
-                    # 精简 torrent_info
-                    if t.torrent_info:
-                        simplified["torrent_info"] = {
-                            "title": t.torrent_info.title,
-                            "size": StringUtils.format_size(t.torrent_info.size),
-                            "seeders": t.torrent_info.seeders,
-                            "peers": t.torrent_info.peers,
-                            "site_name": t.torrent_info.site_name,
-                            "enclosure": t.torrent_info.enclosure,
-                            "page_url": t.torrent_info.page_url,
-                            "volume_factor": t.torrent_info.volume_factor,
-                            "pubdate": t.torrent_info.pubdate
-                        }
-                    # 精简 media_info
-                    if t.media_info:
-                        simplified["media_info"] = {
-                            "title": t.media_info.title,
-                            "en_title": t.media_info.en_title,
-                            "year": t.media_info.year,
-                            "type": t.media_info.type.value if t.media_info.type else None,
-                            "season": t.media_info.season,
-                            "tmdb_id": t.media_info.tmdb_id
-                        }
-                    # 精简 meta_info
-                    if t.meta_info:
-                        simplified["meta_info"] = {
-                            "name": t.meta_info.name,
-                            "cn_name": t.meta_info.cn_name,
-                            "en_name": t.meta_info.en_name,
-                            "year": t.meta_info.year,
-                            "type": t.meta_info.type.value if t.meta_info.type else None,
-                            "begin_season": t.meta_info.begin_season
-                        }
-                    simplified_torrents.append(simplified)
-                result_json = json.dumps(simplified_torrents, ensure_ascii=False, indent=2)
-                # 如果结果被裁剪，添加提示信息
-                if total_count > 50:
-                    return f"注意：搜索结果共找到 {total_count} 条，为节省上下文空间，仅显示前 50 条结果。\n\n{result_json}"
+                await search_chain.async_save_cache(filtered_torrents, SEARCH_RESULT_CACHE_FILE)
+                result_json = json.dumps({
+                    "total_count": len(filtered_torrents),
+                    "message": "搜索完成。请使用 get_search_results 工具获取搜索结果。",
+                    "all_sites": all_sites,
+                    "search_site_ids": search_site_ids,
+                    "filter_options": build_filter_options(filtered_torrents),
+                }, ensure_ascii=False, indent=2)
                 return result_json
             else:
-                return f"未找到相关种子资源: {title}"
+                identity = media_id or tmdb_id or douban_id or bangumi_id or anilist_id
+                result_json = json.dumps({
+                    "message": f"未找到相关种子资源: {identity}",
+                    "all_sites": all_sites,
+                    "search_site_ids": search_site_ids,
+                }, ensure_ascii=False, indent=2)
+                return result_json
         except Exception as e:
             error_message = f"搜索种子时发生错误: {str(e)}"
             logger.error(f"搜索种子失败: {e}", exc_info=True)

@@ -1,5 +1,5 @@
 from abc import ABCMeta, abstractmethod
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, List, Dict, Tuple, Callable, Union
 
 from tqdm import tqdm
@@ -105,6 +105,38 @@ class StorageBase(metaclass=ABCMeta):
         self.storagehelper.reset_storage(self.schema.value)
         self.init_storage()
 
+    @staticmethod
+    def _safe_download_name(name: Optional[str]) -> Optional[str]:
+        """
+        提取可安全落盘的文件名。
+        """
+        if not name:
+            return None
+
+        safe_name = PurePosixPath(str(name).replace("\\", "/")).name
+        if safe_name in ("", ".", ".."):
+            return None
+        return safe_name
+
+    def _build_download_path(
+        self, fileitem: schemas.FileItem, path: Path
+    ) -> Optional[Path]:
+        """
+        构造本地下载路径，避免远端文件名携带目录片段时越过目标目录。
+        """
+        safe_name = self._safe_download_name(fileitem.name)
+        if not safe_name:
+            logger.error(f"【存储】下载文件名无效：{fileitem.name}")
+            return None
+
+        local_path = path / safe_name
+        try:
+            local_path.resolve().relative_to(path.resolve())
+        except ValueError:
+            logger.error(f"【存储】下载路径越界：{fileitem.name} -> {local_path}")
+            return None
+        return local_path
+
     @abstractmethod
     def check(self) -> bool:
         """
@@ -141,6 +173,13 @@ class StorageBase(metaclass=ABCMeta):
         获取文件或目录，不存在返回None
         """
         pass
+
+    def get_item_strict(self, path: Path) -> Optional[schemas.FileItem]:
+        """
+        获取文件或目录，确认不存在返回None；无法确认状态时抛出 StorageQueryError。
+        默认实现不区分「不存在」与「查询失败」，由具体存储按需覆写。
+        """
+        return self.get_item(path)
 
     def get_parent(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         """
@@ -261,13 +300,12 @@ class StorageBase(metaclass=ABCMeta):
                     for sub_file in sub_files:
                         __snapshot_file(sub_file, current_depth + 1)
                 else:
-                    # 记录文件的完整信息用于比对
-                    if getattr(_fileitm, 'modify_time', 0) > last_snapshot_time:
-                        files_info[_fileitm.path] = {
-                            'size': _fileitm.size or 0,
-                            'modify_time': getattr(_fileitm, 'modify_time', 0),
-                            'type': _fileitm.type
-                        }
+                    # 记录文件的完整信息用于比对（始终包含所有文件，由 compare_snapshots 负责检测变化）
+                    files_info[_fileitm.path] = {
+                        'size': _fileitm.size or 0,
+                        'modify_time': getattr(_fileitm, 'modify_time', 0),
+                        'type': _fileitm.type
+                    }
 
             except Exception as e:
                 logger.debug(f"Snapshot error for {_fileitm.path}: {e}")

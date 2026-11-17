@@ -1,15 +1,17 @@
 import copy
 import json
 import random
+import re
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 
 from app import schemas
 from app.chain import ChainBase
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
+from app.chain.mediaserver import MediaServerChain
 from app.chain.search import SearchChain
 from app.chain.tmdb import TmdbChain
 from app.chain.torrents import TorrentsChain
@@ -24,22 +26,766 @@ from app.db.models.subscribe import Subscribe
 from app.db.site_oper import SiteOper
 from app.db.subscribe_oper import SubscribeOper
 from app.db.systemconfig_oper import SystemConfigOper
-from app.helper.subscribe import SubscribeHelper
+from app.helper.interaction import (
+    SlashInteractionManager,
+    build_navigation_buttons,
+    format_markdown_table,
+    page_items,
+    supports_interaction_buttons,
+    supports_markdown,
+    update_or_post_message,
+)
+from app.helper.mediaserver import MediaServerHelper
+from app.helper.server import MoviePilotServerHelper
 from app.helper.torrent import TorrentHelper
 from app.log import logger
-from app.schemas import MediaRecognizeConvertEventData
+from app.schemas import (MediaRecognizeConvertEventData, SubscribeEpisodesRefreshEventData,
+                         SubscribeCompletionCheckEventData)
 from app.schemas.types import MediaType, SystemConfigKey, MessageChannel, NotificationType, EventType, ChainEventType, \
     ContentType
+from app.utils.media import (
+    build_media_key,
+    normalize_media_source,
+    parse_media_key,
+    resolve_media_identity,
+)
+
+subscribe_interaction_manager = SlashInteractionManager()
+
+
+def build_subscribe_meta(subscribe: Subscribe) -> MetaBase:
+    """
+    按订阅对象构造主程序链路共用的 MetaInfo。
+    """
+    meta = MetaInfo(subscribe.name)
+    meta.year = subscribe.year
+    meta.begin_season = subscribe.season
+    meta.type = MediaType(subscribe.type)
+    meta.tmdbid = subscribe.tmdbid
+    meta.doubanid = subscribe.doubanid
+    meta.bangumiid = subscribe.bangumiid
+    meta.anilistid = subscribe.anilistid
+    meta.media_source = subscribe.media_source
+    meta.media_id = subscribe.media_id
+    return meta
+
+
+def _media_recognize_kwargs(mediainfo: MediaInfo) -> dict:
+    """从统一媒体信息构造完整的识别 ID 参数。"""
+    media_source, media_id = resolve_media_identity(media=mediainfo)
+    return {
+        "source": media_source,
+        "mediaid": media_id,
+        "tmdbid": mediainfo.tmdb_id,
+        "doubanid": mediainfo.douban_id,
+        "bangumiid": mediainfo.bangumi_id,
+        "anilistid": mediainfo.anilist_id,
+    }
+
+
+def _subscribe_recognize_kwargs(subscribe: Subscribe) -> dict:
+    """从订阅记录构造完整的识别 ID 参数。"""
+    media_source, media_id = resolve_media_identity(media=subscribe)
+    return {
+        "source": media_source,
+        "mediaid": media_id,
+        "tmdbid": subscribe.tmdbid,
+        "doubanid": subscribe.doubanid,
+        "bangumiid": subscribe.bangumiid,
+        "anilistid": subscribe.anilistid,
+    }
+
+
+def _subscribe_media_key(subscribe: Subscribe) -> Union[str, int, None]:
+    """返回订阅缺失集映射使用的稳定媒体键。"""
+    media_source, media_id = resolve_media_identity(media=subscribe)
+    return build_media_key(media_source, media_id) or media_id
+
+
+def _subscribe_media_keys(subscribe: Subscribe) -> List[Union[str, int]]:
+    """返回新旧缺失集缓存均可识别的订阅媒体键。"""
+    media_source, media_id = resolve_media_identity(media=subscribe)
+    candidates = [
+        build_media_key(media_source, media_id),
+        subscribe.mediaid,
+        subscribe.tmdbid,
+        subscribe.doubanid,
+        subscribe.bangumiid,
+        subscribe.anilistid,
+    ]
+    return [candidate for candidate in candidates if candidate not in (None, "")]
 
 
 class SubscribeChain(ChainBase):
     """
-    订阅管理处理链
+    订阅管理处理链。
+
+    订阅链路同时服务电影、普通电视剧、分集洗版和全集洗版。普通电视剧订阅与
+    分集洗版共享按集事实：note 表示目标集已经存在或已经下载，
+    episode_priority 表示每集已知下载质量；二者可以互相切换。current_priority
+    表示当前洗版模式的资源准入基线：分集洗版按目标范围内的最低按集优先级派生，
+    全集洗版由下载层确认完整覆盖后按整包优先级维护。
+
+    实现上保持三个入口分离：下载事实入口写 note / episode_priority，并在确认
+    全集覆盖时写全集 current_priority；progress 刷新入口计算 lack_episode，且仅
+    分集洗版从按集事实派生 current_priority；完成入口只根据当前模式的最终事实
+    和完成策略收敛订阅状态。电影没有按集事实，电影洗版的 current_priority 由
+    电影下载优先级 writer 单独维护。
     """
 
     _rlock = threading.RLock()
     # 避免莫名原因导致长时间持有锁
     _LOCK_TIMOUT = 3600 * 2
+    _button_page_size = 6
+    _text_page_size = 10
+
+    @staticmethod
+    def __normalize_episode_priority(episode_priority: Optional[dict]) -> Dict[str, int]:
+        """
+        归一化按集洗版优先级状态。
+        """
+        if not isinstance(episode_priority, dict):
+            return {}
+
+        normalized = {}
+        for episode, priority in episode_priority.items():
+            if episode is None or priority is None:
+                continue
+            try:
+                normalized[str(int(episode))] = int(priority)
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    @classmethod
+    def __get_episode_priority(cls, subscribe: Subscribe,
+                               total_episode: Optional[int] = None) -> Dict[str, int]:
+        """
+        获取订阅按集洗版优先级状态。
+        """
+        episode_priority = cls.__normalize_episode_priority(subscribe.episode_priority)
+        if episode_priority:
+            return episode_priority
+
+        if (
+                subscribe.best_version
+                and not cls.__is_full_best_version_enabled(subscribe)
+                and subscribe.type == MediaType.TV.value
+                and subscribe.current_priority is not None
+        ):
+            target_episodes = cls.__get_best_version_target_episodes(subscribe, total_episode=total_episode)
+            return {
+                str(episode): int(subscribe.current_priority)
+                for episode in target_episodes
+            }
+        return {}
+
+    @classmethod
+    def get_episode_priority(cls, subscribe: Subscribe) -> Dict[str, int]:
+        """
+        对外暴露按集洗版优先级状态。
+        """
+        return cls.__get_episode_priority(subscribe)
+
+    @classmethod
+    def __get_best_version_target_episodes(cls, subscribe: Subscribe,
+                                           total_episode: Optional[int] = None) -> List[int]:
+        """
+        获取洗版订阅目标剧集范围。
+        """
+        if subscribe.type != MediaType.TV.value:
+            return []
+
+        start_episode = subscribe.start_episode or 1
+        total_episode = total_episode or subscribe.total_episode or 0
+        if total_episode < start_episode:
+            return []
+        return list(range(start_episode, total_episode + 1))
+
+    @classmethod
+    def __get_downloaded_best_version_episodes(cls, subscribe: Subscribe,
+                                               total_episode: Optional[int] = None) -> List[int]:
+        """
+        获取洗版订阅目标范围内已下载到任意版本的剧集。
+
+        分集洗版的完成态要求 priority==100，但订阅目标满足查询有时只需要确认
+        目标集是否已下载过任意版本，因此这里按 note 与 episode_priority>0 统计。
+        """
+        if subscribe.type != MediaType.TV.value:
+            return []
+
+        start_episode = subscribe.start_episode or 1
+        total_episode = total_episode or subscribe.total_episode or 0
+        if total_episode < start_episode:
+            return []
+        target_episodes = set(range(start_episode, total_episode + 1))
+        downloaded = set()
+        for episode in subscribe.note or []:
+            try:
+                episode_number = int(episode)
+            except (TypeError, ValueError):
+                continue
+            if episode_number in target_episodes:
+                downloaded.add(episode_number)
+        for episode, priority in cls.__get_episode_priority(subscribe, total_episode=total_episode).items():
+            if not str(episode).isdigit():
+                continue
+            try:
+                if float(priority) > 0:
+                    episode_number = int(episode)
+                    if episode_number in target_episodes:
+                        downloaded.add(episode_number)
+            except (TypeError, ValueError):
+                continue
+        return sorted(downloaded)
+
+    @classmethod
+    def __get_pending_best_version_episodes_with_priority(
+            cls,
+            subscribe: Subscribe,
+            episode_priority: Optional[dict] = None,
+            total_episode: Optional[int] = None,
+    ) -> List[int]:
+        """
+        使用指定按集优先级状态获取当前仍需继续洗版的剧集。
+        """
+        target_episodes = cls.__get_best_version_target_episodes(subscribe, total_episode=total_episode)
+        if not target_episodes:
+            return []
+
+        if episode_priority is None:
+            normalized = cls.__get_episode_priority(subscribe, total_episode=total_episode)
+        else:
+            normalized = cls.__normalize_episode_priority(episode_priority)
+        return [episode for episode in target_episodes if normalized.get(str(episode)) != 100]
+
+    @classmethod
+    def _get_pending_best_version_episodes(cls, subscribe: Subscribe,
+                                           total_episode: Optional[int] = None) -> List[int]:
+        """
+        获取当前仍需继续洗版的剧集。
+        """
+        return cls.__get_pending_best_version_episodes_with_priority(subscribe, total_episode=total_episode)
+
+    @classmethod
+    def compute_lack_episode(
+            cls,
+            subscribe: Subscribe,
+            no_exists: Optional[Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]]] = None,
+    ) -> int:
+        """
+        计算订阅范围内尚未下载到任何版本的集数。
+
+        普通电视剧订阅以媒体库缺失结果为准；调用方没有缺失结果时按空缺失处理，
+        避免入口级刷新失败把未知状态写成异常。洗版电视剧订阅按 note 与
+        episode_priority>0 判断是否已有任意版本落点，priority<100 仍表示已下载过任意版本。
+        """
+        if subscribe.type != MediaType.TV.value:
+            return 0
+
+        if not subscribe.best_version:
+            no_exists = no_exists or {}
+            left_seasons = next(
+                (
+                    no_exists.get(media_key)
+                    for media_key in _subscribe_media_keys(subscribe)
+                    if no_exists.get(media_key) is not None
+                ),
+                {},
+            )
+            for season_info in left_seasons.values():
+                if season_info.season != subscribe.season:
+                    continue
+                left_episodes = season_info.episodes
+                if not left_episodes:
+                    return season_info.total_episode or 0
+                return len(left_episodes)
+            return 0
+
+        total_episode = subscribe.total_episode or 0
+        if not total_episode:
+            return 0
+        start_episode = subscribe.start_episode or 1
+        if total_episode < start_episode:
+            return 0
+
+        target_episodes = set(range(start_episode, total_episode + 1))
+        downloaded: set = set()
+        for episode in subscribe.note or []:
+            try:
+                episode_number = int(episode)
+            except (TypeError, ValueError):
+                continue
+            if episode_number in target_episodes:
+                downloaded.add(episode_number)
+        for episode, priority in cls.__get_episode_priority(subscribe).items():
+            try:
+                if float(priority) <= 0:
+                    continue
+                episode_number = int(episode)
+            except (TypeError, ValueError):
+                continue
+            if episode_number in target_episodes:
+                downloaded.add(episode_number)
+        return len(target_episodes - downloaded)
+
+    @classmethod
+    def get_best_version_current_priority(
+            cls,
+            subscribe: Subscribe,
+            episode_priority: Optional[dict] = None,
+    ) -> int:
+        """
+        获取洗版订阅当前优先级状态。
+        """
+        if not subscribe.best_version or subscribe.type != MediaType.TV.value:
+            return subscribe.current_priority or 0
+        if cls.__is_full_best_version_enabled(subscribe):
+            return subscribe.current_priority or 0
+
+        target_episodes = cls.__get_best_version_target_episodes(subscribe)
+        if not target_episodes:
+            return subscribe.current_priority or 0
+
+        if episode_priority is None:
+            normalized = cls.__get_episode_priority(subscribe)
+        else:
+            normalized = cls.__normalize_episode_priority(episode_priority)
+        return min(
+            (normalized.get(str(episode), 0) for episode in target_episodes),
+            default=0,
+        )
+
+    @classmethod
+    def __prepare_best_version_total_expansion_fields(
+            cls,
+            subscribe: Subscribe,
+            total_episode: int,
+    ) -> Dict[str, Any]:
+        """
+        准备洗版电视剧总集数扩展后需要写库的字段。
+
+        该方法会同步传入对象上的 total_episode / episode_priority，方便同一链路后续
+        按最终快照继续计算进度；实际数据库写入由调用方统一执行。
+        """
+        update_data: Dict[str, Any] = {"total_episode": total_episode}
+        old_total_episode = subscribe.total_episode or 0
+        subscribe.total_episode = total_episode
+
+        if subscribe.best_version and subscribe.type == MediaType.TV.value:
+            episode_priority = cls.__get_episode_priority(
+                subscribe,
+                total_episode=old_total_episode,
+            )
+            if (
+                    not cls.__is_full_best_version_enabled(subscribe)
+                    and not episode_priority
+                    and subscribe.current_priority is not None
+            ):
+                episode_priority = {
+                    str(episode): int(subscribe.current_priority)
+                    for episode in cls.__get_best_version_target_episodes(
+                        subscribe,
+                        total_episode=old_total_episode,
+                    )
+                }
+            subscribe.episode_priority = episode_priority
+            update_data["episode_priority"] = episode_priority
+            if cls.__is_full_best_version_enabled(subscribe):
+                subscribe.current_priority = 0
+                update_data["current_priority"] = 0
+
+        update_data.update(cls.__prepare_subscribe_progress_fields(subscribe=subscribe, no_exists={}))
+        return update_data
+
+    @classmethod
+    def __prepare_best_version_total_change_fields(
+            cls,
+            subscribe: Subscribe,
+            total_episode: int,
+            old_total_episode: int,
+    ) -> Dict[str, Any]:
+        """
+        准备洗版电视剧总集数变化后需要写库的字段。
+
+        总集数变化会改变目标范围，按集优先级只保留新范围内的目标集，避免范围外
+        旧状态继续参与完成集、缺失集和当前优先级计算。
+        """
+        update_data: Dict[str, Any] = {"total_episode": total_episode}
+        target_episodes = set(cls.__get_best_version_target_episodes(
+            subscribe,
+            total_episode=total_episode,
+        ))
+        episode_priority = cls.__get_episode_priority(
+            subscribe,
+            total_episode=old_total_episode,
+        )
+        filtered_priority = {
+            str(episode): priority
+            for episode, priority in episode_priority.items()
+            if int(episode) in target_episodes
+        }
+        subscribe.total_episode = total_episode
+        subscribe.episode_priority = filtered_priority
+        if cls.__is_full_best_version_enabled(subscribe):
+            current_priority = 0 if total_episode > old_total_episode else subscribe.current_priority
+        else:
+            current_priority = 0 if not target_episodes else cls.get_best_version_current_priority(
+                subscribe,
+                episode_priority=filtered_priority,
+            )
+        subscribe.current_priority = current_priority
+        update_data["episode_priority"] = filtered_priority
+        update_data["current_priority"] = current_priority
+        update_data.update(cls.__prepare_subscribe_progress_fields(subscribe=subscribe, no_exists={}))
+        return update_data
+
+    @classmethod
+    def __prepare_total_episode_change_fields(
+            cls,
+            subscribe: Subscribe,
+            total_episode: int,
+            old_total_episode: int,
+    ) -> Dict[str, Any]:
+        """
+        准备已有订阅总集数持久化字段，并同步内存对象上的总集数快照。
+        """
+        if subscribe.best_version and subscribe.type == MediaType.TV.value:
+            return cls.__prepare_best_version_total_change_fields(
+                subscribe=subscribe,
+                total_episode=total_episode,
+                old_total_episode=old_total_episode,
+            )
+
+        subscribe.total_episode = total_episode
+        return {
+            "total_episode": total_episode,
+            "lack_episode": max(
+                (subscribe.lack_episode or 0) + (total_episode - old_total_episode),
+                0,
+            ),
+        }
+
+    @classmethod
+    def __is_best_version_complete(cls, subscribe: Subscribe) -> bool:
+        """
+        判断洗版订阅是否已完成。
+        """
+        if not subscribe.best_version:
+            return False
+        if subscribe.type != MediaType.TV.value:
+            return subscribe.current_priority == 100
+        if cls.__is_full_best_version_enabled(subscribe):
+            return subscribe.current_priority == 100
+
+        target_episodes = cls.__get_best_version_target_episodes(subscribe)
+        if not target_episodes:
+            return subscribe.current_priority == 100
+
+        episode_priority = cls.__get_episode_priority(subscribe)
+        return all(episode_priority.get(str(episode)) == 100 for episode in target_episodes)
+
+    @classmethod
+    def is_best_version_complete(cls, subscribe: Subscribe) -> bool:
+        """
+        对外暴露洗版完成判断。
+        """
+        return cls.__is_best_version_complete(subscribe)
+
+    @classmethod
+    def __is_best_version_complete_with_priority(
+            cls,
+            subscribe: Subscribe,
+            episode_priority: Optional[dict] = None,
+    ) -> bool:
+        """
+        使用指定按集优先级状态判断洗版是否已完成。
+        """
+        if not subscribe.best_version:
+            return False
+        if subscribe.type != MediaType.TV.value:
+            return subscribe.current_priority == 100
+        if cls.__is_full_best_version_enabled(subscribe):
+            return subscribe.current_priority == 100
+
+        target_episodes = cls.__get_best_version_target_episodes(subscribe)
+        if not target_episodes:
+            return subscribe.current_priority == 100
+
+        return not cls.__get_pending_best_version_episodes_with_priority(subscribe, episode_priority)
+
+    @staticmethod
+    def __get_downloaded_episodes(downloads: Optional[List[Context]]) -> List[int]:
+        """
+        获取本次下载实际涉及的剧集。
+        """
+        if not downloads:
+            return []
+
+        downloaded_episodes = set()
+        for context in downloads:
+            selected_episodes = getattr(context, "selected_episodes", None)
+            if selected_episodes is None:
+                selected_episodes = context.meta_info.episode_list if context.meta_info else []
+            for episode in selected_episodes or []:
+                try:
+                    downloaded_episodes.add(int(episode))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(downloaded_episodes)
+
+    @classmethod
+    def __get_best_version_completed_episodes(cls, subscribe: Subscribe) -> List[int]:
+        """
+        获取已完成洗版的剧集。
+        """
+        episode_priority = cls.__get_episode_priority(subscribe)
+        target_episodes = set(cls.__get_best_version_target_episodes(subscribe))
+        return sorted(
+            int(episode) for episode, priority in episode_priority.items()
+            if str(episode).isdigit() and int(episode) in target_episodes and priority == 100
+        )
+
+    @classmethod
+    def __get_best_version_interested_episodes(
+            cls,
+            subscribe: Subscribe,
+            context: Context,
+            priority: int,
+    ) -> List[int]:
+        """
+        获取当前资源中仍值得继续洗版的剧集。
+        """
+        if subscribe.type != MediaType.TV.value:
+            return []
+
+        target_episodes = set(cls.__get_best_version_target_episodes(subscribe))
+        if not target_episodes:
+            return []
+
+        selected_episodes = getattr(context, "selected_episodes", None)
+        if selected_episodes is None:
+            selected_episodes = context.meta_info.episode_list if context.meta_info else []
+        if not selected_episodes:
+            episode_priority = cls.__get_episode_priority(subscribe)
+            return sorted([
+                episode for episode in target_episodes
+                if episode_priority.get(str(episode)) is None or priority > episode_priority.get(str(episode))
+            ])
+
+        episode_priority = cls.__get_episode_priority(subscribe)
+        interested = []
+        for episode in selected_episodes:
+            try:
+                episode_num = int(episode)
+            except (TypeError, ValueError):
+                continue
+            if episode_num not in target_episodes:
+                continue
+            current_priority = episode_priority.get(str(episode_num))
+            if current_priority is None or priority > current_priority:
+                interested.append(episode_num)
+        return sorted(set(interested))
+
+    @classmethod
+    def __prepare_best_version_tv_candidate(
+            cls,
+            subscribe: Subscribe,
+            context: Context,
+            priority: int,
+    ) -> bool:
+        """
+        校验电视剧洗版候选，并为分集模式设置允许下载的剧集范围。
+
+        全集模式按当前准入基线筛选；分集模式设置能严格提升质量的目标集范围。
+        """
+        if cls.__is_full_best_version_enabled(subscribe):
+            try:
+                return int(priority or 0) > int(subscribe.current_priority or 0)
+            except (TypeError, ValueError):
+                return False
+
+        interested_episodes = cls.__get_best_version_interested_episodes(
+            subscribe=subscribe,
+            context=context,
+            priority=priority,
+        )
+        if not interested_episodes:
+            return False
+        context.allowed_episodes = set(interested_episodes)
+        return True
+
+    @classmethod
+    def __is_full_best_version_enabled(cls, subscribe: Subscribe) -> bool:
+        """
+        判断当前订阅是否启用了电视剧全集洗版。
+        """
+        return (
+                bool(subscribe.best_version_full)
+                and bool(subscribe.best_version)
+                and subscribe.type == MediaType.TV.value
+        )
+
+    @classmethod
+    def __is_full_season_resource(cls, meta: MetaBase, subscribe: Subscribe) -> bool:
+        """
+        判断候选资源是否覆盖订阅目标全集范围。
+        """
+        season_list = meta.season_list or [1]
+        if len(season_list) != 1:
+            return False
+        if subscribe.season is not None and season_list[0] != subscribe.season:
+            return False
+
+        episodes = meta.episode_list
+        if not episodes:
+            # 资源未标出单集时按整季包处理，后续下载前仍会解析种子文件确认完整性。
+            return True
+
+        target_episodes = set(cls.__get_best_version_target_episodes(subscribe))
+        if not target_episodes:
+            return False
+        return target_episodes.issubset(set(episodes))
+
+    @classmethod
+    def __is_full_season_best_version_resource(cls, meta: MetaBase, subscribe: Subscribe) -> bool:
+        """
+        判断候选资源是否符合全集洗版资源约束。
+        """
+        if not cls.__is_full_best_version_enabled(subscribe):
+            return True
+
+        return cls.__is_full_season_resource(meta=meta, subscribe=subscribe)
+
+    @classmethod
+    def __should_prefer_full_pack_for_episode_best_version(
+            cls,
+            subscribe: Subscribe,
+            priority: int,
+    ) -> bool:
+        """
+        判断分集洗版是否应优先下载整包。
+
+        整包优先级必须严格高于每个目标集；否则交回按集路径，只下载能提升质量的集。
+        """
+        if (
+                subscribe.type != MediaType.TV.value
+                or cls.__is_full_best_version_enabled(subscribe)
+        ):
+            return False
+
+        target_episodes = cls.__get_best_version_target_episodes(subscribe)
+        if not target_episodes:
+            return False
+
+        try:
+            resource_priority = int(priority or 0)
+        except (TypeError, ValueError):
+            resource_priority = 0
+
+        episode_priority = cls.__get_episode_priority(subscribe)
+        return all(
+            resource_priority > episode_priority.get(str(episode), 0)
+            for episode in target_episodes
+        )
+
+    @classmethod
+    def __build_full_pack_first_no_exists(
+            cls,
+            subscribe: Subscribe,
+            mediakey: Union[int, str],
+    ) -> Optional[Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]]]:
+        """
+        构造分集洗版优先全集时使用的整季缺失范围。
+        """
+        if (
+                not subscribe.best_version
+                or cls.__is_full_best_version_enabled(subscribe)
+                or subscribe.type != MediaType.TV.value
+        ):
+            return None
+
+        target_episodes = cls.__get_best_version_target_episodes(subscribe)
+        if not target_episodes:
+            return None
+
+        return {
+            mediakey: {
+                subscribe.season: schemas.NotExistMediaInfo(
+                    season=subscribe.season,
+                    episodes=[],
+                    total_episode=subscribe.total_episode,
+                    start_episode=subscribe.start_episode or 1,
+                    require_complete_coverage=True,
+                )
+            }
+        }
+
+    def __download_best_version_with_full_pack_first(
+            self,
+            contexts: List[Context],
+            no_exists: Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]],
+            subscribe: Subscribe,
+            mediakey: Union[int, str],
+            username: Optional[str] = None,
+            save_path: Optional[str] = None,
+            downloader: Optional[str] = None,
+            source: Optional[str] = None,
+    ) -> Tuple[List[Context], Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]]]:
+        """
+        TV 分集洗版先尝试覆盖目标范围的全集资源，失败后回退到按集下载。
+        """
+        full_pack_no_exists = self.__build_full_pack_first_no_exists(subscribe=subscribe, mediakey=mediakey)
+        full_season_contexts = [
+            context for context in contexts
+            if context.media_info.type == MediaType.TV
+               and self.__is_full_season_resource(meta=context.meta_info, subscribe=subscribe)
+        ] if full_pack_no_exists else []
+        target_episodes = self.__get_best_version_target_episodes(subscribe)
+        target_range = f"{target_episodes[0]}-{target_episodes[-1]}" if target_episodes else "empty"
+        episode_priority_gate = self.__get_episode_priority(subscribe)
+        full_pack_contexts = []
+        for context in full_season_contexts:
+            candidate_priority = context.torrent_info.pri_order
+            accepted = self.__should_prefer_full_pack_for_episode_best_version(
+                subscribe=subscribe,
+                priority=candidate_priority,
+            )
+            logger.info(
+                f"{subscribe.name} 整包候选优先级判断：candidate_priority={candidate_priority}，"
+                f"episode_priority={episode_priority_gate}，target_range={target_range}，"
+                f"decision={'accept' if accepted else 'reject'}"
+            )
+            if accepted:
+                full_pack_contexts.append(context)
+
+        if full_season_contexts and not full_pack_contexts:
+            logger.info(f"{subscribe.name} 全集候选优先级未高于全部目标集，回退到分集洗版")
+
+        if full_pack_contexts:
+            logger.info(f"{subscribe.name} 分集洗版优先尝试全集资源，共匹配到 {len(full_pack_contexts)} 个候选")
+            downloads, lefts = DownloadChain().batch_download(
+                contexts=full_pack_contexts,
+                no_exists=full_pack_no_exists,
+                username=username,
+                save_path=save_path,
+                downloader=downloader,
+                source=source,
+                custom_words=subscribe.custom_words,
+            )
+            if downloads:
+                return downloads, lefts
+            logger.info(f"{subscribe.name} 未下载到全集资源，回退到分集洗版")
+
+        return DownloadChain().batch_download(
+            contexts=contexts,
+            no_exists=no_exists,
+            username=username,
+            save_path=save_path,
+            downloader=downloader,
+            source=source,
+            custom_words=subscribe.custom_words,
+        )
 
     @staticmethod
     def __get_event_media(_mediaid: str, _meta: MetaBase) -> Optional[MediaInfo]:
@@ -57,10 +803,12 @@ class SubscribeChain(ChainBase):
             if event_data.media_dict:
                 mediachain = MediaChain()
                 new_id = event_data.media_dict.get("id")
-                if event_data.convert_type == "themoviedb":
-                    return mediachain.recognize_media(meta=_meta, tmdbid=new_id)
-                elif event_data.convert_type == "douban":
-                    return mediachain.recognize_media(meta=_meta, doubanid=new_id)
+                if new_id is not None and event_data.convert_type:
+                    return mediachain.recognize_media(
+                        meta=_meta,
+                        source=event_data.convert_type,
+                        mediaid=str(new_id),
+                    )
         return None
 
     @staticmethod
@@ -79,10 +827,12 @@ class SubscribeChain(ChainBase):
             if event_data.media_dict:
                 mediachain = MediaChain()
                 new_id = event_data.media_dict.get("id")
-                if event_data.convert_type == "themoviedb":
-                    return await mediachain.async_recognize_media(meta=_meta, tmdbid=new_id)
-                elif event_data.convert_type == "douban":
-                    return await mediachain.async_recognize_media(meta=_meta, doubanid=new_id)
+                if new_id is not None and event_data.convert_type:
+                    return await mediachain.async_recognize_media(
+                        meta=_meta,
+                        source=event_data.convert_type,
+                        mediaid=str(new_id),
+                    )
         return None
 
     def __get_default_kwargs(self, mtype: MediaType, **kwargs) -> dict:
@@ -103,8 +853,10 @@ class SubscribeChain(ChainBase):
                 "include") else kwargs.get("include"),
             'exclude': self.__get_default_subscribe_config(mtype, "exclude") if not kwargs.get(
                 "exclude") else kwargs.get("exclude"),
-            'best_version': self.__get_default_subscribe_config(mtype, "best_version") if not kwargs.get(
-                "best_version") else kwargs.get("best_version"),
+            'best_version': self.__get_default_subscribe_config(mtype, "best_version")
+            if kwargs.get("best_version") is None else kwargs.get("best_version"),
+            'best_version_full': self.__get_default_subscribe_config(mtype, "best_version_full")
+            if kwargs.get("best_version_full") is None else kwargs.get("best_version_full"),
             'search_imdbid': self.__get_default_subscribe_config(mtype, "search_imdbid") if not kwargs.get(
                 "search_imdbid") else kwargs.get("search_imdbid"),
             'sites': self.__get_default_subscribe_config(mtype, "sites") or None if not kwargs.get(
@@ -131,6 +883,9 @@ class SubscribeChain(ChainBase):
             username: Optional[str] = None,
             message: Optional[bool] = True,
             exist_ok: Optional[bool] = False,
+            anilistid: Optional[int] = None,
+            media_source: Optional[str] = None,
+            media_id: Optional[str] = None,
             **kwargs) -> Tuple[Optional[int], str]:
         """
         识别媒体信息并添加订阅
@@ -144,42 +899,51 @@ class SubscribeChain(ChainBase):
             metainfo.year = year
         if mtype:
             metainfo.type = mtype
-        if season:
+        if season is not None:
             metainfo.type = MediaType.TV
             metainfo.begin_season = season
-        # 识别媒体信息
-        if settings.RECOGNIZE_SOURCE == "themoviedb":
-            # TMDB识别模式
-            if not tmdbid:
-                if doubanid:
-                    # 将豆瓣信息转换为TMDB信息
-                    tmdbinfo = MediaChain().get_tmdbinfo_by_doubanid(doubanid=doubanid, mtype=mtype)
-                    if tmdbinfo:
-                        mediainfo = MediaInfo(tmdb_info=tmdbinfo)
-                elif mediaid:
-                    # 未知前缀，广播事件解析媒体信息
-                    mediainfo = self.__get_event_media(mediaid, metainfo)
-            else:
-                # 使用TMDBID识别
-                mediainfo = self.recognize_media(meta=metainfo, mtype=mtype, tmdbid=tmdbid,
-                                                 episode_group=episode_group, cache=False)
-        else:
-            if doubanid:
-                # 豆瓣识别模式，不使用缓存
-                mediainfo = self.recognize_media(meta=metainfo, mtype=mtype, doubanid=doubanid, cache=False)
-            elif mediaid:
-                # 未知前缀，广播事件解析媒体信息
-                mediainfo = self.__get_event_media(mediaid, metainfo)
-            if mediainfo:
-                # 豆瓣标题处理
-                meta = MetaInfo(mediainfo.title)
-                mediainfo.title = meta.name
-                if not season:
-                    season = meta.begin_season
+        if not media_source and not media_id and mediaid:
+            media_source, media_id = parse_media_key(mediaid)
+        resolved_source, resolved_media_id = resolve_media_identity(
+            source=media_source,
+            media_id=media_id,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
+        )
+        if resolved_source and resolved_media_id:
+            media_source, media_id = resolved_source, resolved_media_id
+        if any((media_id, tmdbid, doubanid, bangumiid, anilistid)):
+            mediainfo = self.recognize_media(
+                meta=metainfo,
+                mtype=mtype,
+                source=media_source,
+                mediaid=media_id,
+                tmdbid=tmdbid,
+                doubanid=doubanid,
+                bangumiid=bangumiid,
+                anilistid=anilistid,
+                episode_group=episode_group,
+                cache=False,
+            )
+        elif mediaid:
+            mediainfo = self.__get_event_media(mediaid, metainfo)
 
-        # 使用名称识别兜底
+        if mediainfo and mediainfo.source != "themoviedb":
+            meta = MetaInfo(mediainfo.title)
+            mediainfo.title = meta.name
+            if season is None:
+                season = meta.begin_season
+
+        # 明确来源时只允许在同一来源内按名称兜底，不能切换主识别源。
         if not mediainfo:
-            mediainfo = self.recognize_media(meta=metainfo, episode_group=episode_group)
+            mediainfo = MediaChain().recognize_by_meta(
+                metainfo,
+                source=media_source,
+                episode_group=episode_group,
+                obtain_images=False,
+            )
 
         # 识别失败
         if not mediainfo:
@@ -188,16 +952,14 @@ class SubscribeChain(ChainBase):
 
         # 总集数
         if mediainfo.type == MediaType.TV:
-            if not season:
+            if season is None:
                 season = 1
             # 总集数
             if not kwargs.get('total_episode'):
                 if not mediainfo.seasons or episode_group:
                     # 补充媒体信息
                     mediainfo = self.recognize_media(mtype=mediainfo.type,
-                                                     tmdbid=mediainfo.tmdb_id,
-                                                     doubanid=mediainfo.douban_id,
-                                                     bangumiid=mediainfo.bangumi_id,
+                                                     **_media_recognize_kwargs(mediainfo),
                                                      episode_group=episode_group,
                                                      cache=False)
                     if not mediainfo:
@@ -206,7 +968,16 @@ class SubscribeChain(ChainBase):
                     if not mediainfo.seasons:
                         logger.error(f"媒体信息中没有季集信息，标题：{title}，tmdbid：{tmdbid}，doubanid：{doubanid}")
                         return None, "媒体信息中没有季集信息"
-                total_episode = len(mediainfo.seasons.get(season) or [])
+                current_total_episode = len(mediainfo.seasons.get(season) or [])
+                # 创建场景没有旧订阅事实，仅允许外部补正未知或扩展总集数。
+                total_episode = self.__apply_episodes_refresh(
+                    current_total_episode, season=season, mediainfo=mediainfo,
+                    tmdbid=mediainfo.tmdb_id, doubanid=mediainfo.douban_id,
+                    bangumiid=mediainfo.bangumi_id, anilistid=mediainfo.anilist_id,
+                    media_source=resolve_media_identity(media=mediainfo)[0],
+                    media_id=resolve_media_identity(media=mediainfo)[1], scene="create")
+                if current_total_episode and total_episode < current_total_episode:
+                    total_episode = current_total_episode
                 if not total_episode:
                     logger.error(f'未获取到总集数，标题：{title}，tmdbid：{tmdbid}, doubanid：{doubanid}')
                     return None, f"未获取到第 {season} 季的总集数"
@@ -229,6 +1000,13 @@ class SubscribeChain(ChainBase):
             mediainfo.douban_id = doubanid
         if bangumiid:
             mediainfo.bangumi_id = bangumiid
+        if anilistid:
+            mediainfo.anilist_id = anilistid
+
+        media_source, media_id = resolve_media_identity(
+            media=mediainfo, source=media_source, media_id=media_id
+        )
+        kwargs.update({"media_source": media_source, "media_id": media_id})
 
         # 添加订阅
         kwargs.update(self.__get_default_kwargs(mediainfo.type, **kwargs))
@@ -276,7 +1054,7 @@ class SubscribeChain(ChainBase):
             "mediainfo": mediainfo.to_dict(),
         })
         # 统计订阅
-        SubscribeHelper().sub_reg_async({
+        MoviePilotServerHelper.sub_reg_async({
             "name": title,
             "year": year,
             "type": metainfo.type.value,
@@ -285,7 +1063,10 @@ class SubscribeChain(ChainBase):
             "tvdbid": mediainfo.tvdb_id,
             "doubanid": mediainfo.douban_id,
             "bangumiid": mediainfo.bangumi_id,
-            "season": metainfo.begin_season,
+            "anilistid": mediainfo.anilist_id,
+            "media_source": media_source,
+            "media_id": media_id,
+            "season": season,
             "poster": mediainfo.get_poster_image(),
             "backdrop": mediainfo.get_backdrop_image(),
             "vote": mediainfo.vote_average,
@@ -308,6 +1089,9 @@ class SubscribeChain(ChainBase):
                         username: Optional[str] = None,
                         message: Optional[bool] = True,
                         exist_ok: Optional[bool] = False,
+                        anilistid: Optional[int] = None,
+                        media_source: Optional[str] = None,
+                        media_id: Optional[str] = None,
                         **kwargs) -> Tuple[Optional[int], str]:
         """
         异步识别媒体信息并添加订阅
@@ -321,42 +1105,51 @@ class SubscribeChain(ChainBase):
             metainfo.year = year
         if mtype:
             metainfo.type = mtype
-        if season:
+        if season is not None:
             metainfo.type = MediaType.TV
             metainfo.begin_season = season
-        # 识别媒体信息
-        if settings.RECOGNIZE_SOURCE == "themoviedb":
-            # TMDB识别模式
-            if not tmdbid:
-                if doubanid:
-                    # 将豆瓣信息转换为TMDB信息
-                    tmdbinfo = await MediaChain().async_get_tmdbinfo_by_doubanid(doubanid=doubanid, mtype=mtype)
-                    if tmdbinfo:
-                        mediainfo = MediaInfo(tmdb_info=tmdbinfo)
-                elif mediaid:
-                    # 未知前缀，广播事件解析媒体信息
-                    mediainfo = await self.__async_get_event_meida(mediaid, metainfo)
-            else:
-                # 使用TMDBID识别
-                mediainfo = await self.async_recognize_media(meta=metainfo, mtype=mtype, tmdbid=tmdbid,
-                                                             episode_group=episode_group, cache=False)
-        else:
-            if doubanid:
-                # 豆瓣识别模式，不使用缓存
-                mediainfo = await self.async_recognize_media(meta=metainfo, mtype=mtype, doubanid=doubanid, cache=False)
-            elif mediaid:
-                # 未知前缀，广播事件解析媒体信息
-                mediainfo = await self.__async_get_event_meida(mediaid, metainfo)
-            if mediainfo:
-                # 豆瓣标题处理
-                meta = MetaInfo(mediainfo.title)
-                mediainfo.title = meta.name
-                if not season:
-                    season = meta.begin_season
+        if not media_source and not media_id and mediaid:
+            media_source, media_id = parse_media_key(mediaid)
+        resolved_source, resolved_media_id = resolve_media_identity(
+            source=media_source,
+            media_id=media_id,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
+        )
+        if resolved_source and resolved_media_id:
+            media_source, media_id = resolved_source, resolved_media_id
+        if any((media_id, tmdbid, doubanid, bangumiid, anilistid)):
+            mediainfo = await self.async_recognize_media(
+                meta=metainfo,
+                mtype=mtype,
+                source=media_source,
+                mediaid=media_id,
+                tmdbid=tmdbid,
+                doubanid=doubanid,
+                bangumiid=bangumiid,
+                anilistid=anilistid,
+                episode_group=episode_group,
+                cache=False,
+            )
+        elif mediaid:
+            mediainfo = await self.__async_get_event_meida(mediaid, metainfo)
 
-        # 使用名称识别兜底
+        if mediainfo and mediainfo.source != "themoviedb":
+            meta = MetaInfo(mediainfo.title)
+            mediainfo.title = meta.name
+            if season is None:
+                season = meta.begin_season
+
+        # 明确来源时只允许在同一来源内按名称兜底，不能切换主识别源。
         if not mediainfo:
-            mediainfo = await self.async_recognize_media(meta=metainfo, episode_group=episode_group)
+            mediainfo = await MediaChain().async_recognize_by_meta(
+                metainfo,
+                source=media_source,
+                episode_group=episode_group,
+                obtain_images=False,
+            )
 
         # 识别失败
         if not mediainfo:
@@ -365,16 +1158,14 @@ class SubscribeChain(ChainBase):
 
         # 总集数
         if mediainfo.type == MediaType.TV:
-            if not season:
+            if season is None:
                 season = 1
             # 总集数
             if not kwargs.get('total_episode'):
                 if not mediainfo.seasons or episode_group:
                     # 补充媒体信息
                     mediainfo = await self.async_recognize_media(mtype=mediainfo.type,
-                                                                 tmdbid=mediainfo.tmdb_id,
-                                                                 doubanid=mediainfo.douban_id,
-                                                                 bangumiid=mediainfo.bangumi_id,
+                                                                 **_media_recognize_kwargs(mediainfo),
                                                                  episode_group=episode_group,
                                                                  cache=False)
                     if not mediainfo:
@@ -383,7 +1174,16 @@ class SubscribeChain(ChainBase):
                     if not mediainfo.seasons:
                         logger.error(f"媒体信息中没有季集信息，标题：{title}，tmdbid：{tmdbid}，doubanid：{doubanid}")
                         return None, "媒体信息中没有季集信息"
-                total_episode = len(mediainfo.seasons.get(season) or [])
+                current_total_episode = len(mediainfo.seasons.get(season) or [])
+                # 创建场景没有旧订阅事实，仅允许外部补正未知或扩展总集数。
+                total_episode = await self.__async_apply_episodes_refresh(
+                    current_total_episode, season=season, mediainfo=mediainfo,
+                    tmdbid=mediainfo.tmdb_id, doubanid=mediainfo.douban_id,
+                    bangumiid=mediainfo.bangumi_id, anilistid=mediainfo.anilist_id,
+                    media_source=resolve_media_identity(media=mediainfo)[0],
+                    media_id=resolve_media_identity(media=mediainfo)[1], scene="create")
+                if current_total_episode and total_episode < current_total_episode:
+                    total_episode = current_total_episode
                 if not total_episode:
                     logger.error(f'未获取到总集数，标题：{title}，tmdbid：{tmdbid}, doubanid：{doubanid}')
                     return None, f"未获取到第 {season} 季的总集数"
@@ -406,6 +1206,13 @@ class SubscribeChain(ChainBase):
             mediainfo.douban_id = doubanid
         if bangumiid:
             mediainfo.bangumi_id = bangumiid
+        if anilistid:
+            mediainfo.anilist_id = anilistid
+
+        media_source, media_id = resolve_media_identity(
+            media=mediainfo, source=media_source, media_id=media_id
+        )
+        kwargs.update({"media_source": media_source, "media_id": media_id})
 
         # 列新默认参数
         kwargs.update(self.__get_default_kwargs(mediainfo.type, **kwargs))
@@ -453,7 +1260,7 @@ class SubscribeChain(ChainBase):
             "mediainfo": mediainfo.to_dict(),
         })
         # 统计订阅
-        await SubscribeHelper().async_sub_reg({
+        await MoviePilotServerHelper.async_sub_reg({
             "name": title,
             "year": year,
             "type": metainfo.type.value,
@@ -462,7 +1269,10 @@ class SubscribeChain(ChainBase):
             "tvdbid": mediainfo.tvdb_id,
             "doubanid": mediainfo.douban_id,
             "bangumiid": mediainfo.bangumi_id,
-            "season": metainfo.begin_season,
+            "anilistid": mediainfo.anilist_id,
+            "media_source": media_source,
+            "media_id": media_id,
+            "season": season,
             "poster": mediainfo.get_poster_image(),
             "backdrop": mediainfo.get_backdrop_image(),
             "vote": mediainfo.vote_average,
@@ -476,18 +1286,33 @@ class SubscribeChain(ChainBase):
         """
         判断订阅是否已存在
         """
-        if SubscribeOper().exists(tmdbid=mediainfo.tmdb_id,
-                                  doubanid=mediainfo.douban_id,
-                                  season=meta.begin_season if meta else None):
+        media_source, media_id = resolve_media_identity(media=mediainfo)
+        if SubscribeOper().exists(
+                tmdbid=mediainfo.tmdb_id,
+                doubanid=mediainfo.douban_id,
+                bangumiid=mediainfo.bangumi_id,
+                anilistid=mediainfo.anilist_id,
+                media_source=media_source,
+                media_id=media_id,
+                season=meta.begin_season if meta else None,
+                episode_group=mediainfo.episode_group,
+        ):
             return True
         return False
 
-    def search(self, sid: Optional[int] = None, state: Optional[str] = 'N', manual: Optional[bool] = False):
+    def search(
+            self,
+            sid: Optional[int] = None,
+            state: Optional[str] = 'N',
+            manual: Optional[bool] = False,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> None:
         """
         订阅搜索
         :param sid: 订阅ID，有值时只处理该订阅
         :param state: 订阅状态 N:新建, R:订阅中, P:待定, S:暂停
         :param manual: 是否手动搜索
+        :param progress_callback: 定时服务进度更新回调
         :return: 更新订阅状态为R或删除订阅
         """
         lock_acquired = False
@@ -505,14 +1330,32 @@ class SubscribeChain(ChainBase):
                 subscribes = [subscribe] if subscribe else []
             else:
                 subscribes = subscribeoper.list(self.get_states_for_search(state))
+            total_num = len(subscribes)
+            if progress_callback:
+                progress_callback(
+                    value=0,
+                    text=f"开始订阅搜索，共 {total_num} 个订阅 ...",
+                    data={"total": total_num, "finished": 0},
+                )
 
             try:
                 # 遍历订阅
-                for subscribe in subscribes:
+                for index, subscribe in enumerate(subscribes, start=1):
                     if global_vars.is_system_stopped:
                         break
-                    mediakey = subscribe.tmdbid or subscribe.doubanid
+                    if progress_callback:
+                        progress_callback(
+                            value=(index - 1) / total_num * 100 if total_num else 100,
+                            text=f"正在搜索订阅（{index}/{total_num}）{subscribe.name} ...",
+                            data={
+                                "total": total_num,
+                                "finished": index - 1,
+                                "current": subscribe.id,
+                            },
+                        )
+                    mediakey = _subscribe_media_key(subscribe)
                     custom_word_list = subscribe.custom_words.split("\n") if subscribe.custom_words else None
+                    search_attempted = False
                     # 校验当前时间减订阅创建时间是否大于1分钟，否则跳过先，留出编辑订阅的时间
                     if subscribe.date:
                         now = datetime.now()
@@ -524,24 +1367,27 @@ class SubscribeChain(ChainBase):
                     if not sid and state in ['R', 'P']:
                         sleep_time = random.randint(60, 300)
                         logger.info(f'订阅搜索随机休眠 {sleep_time} 秒 ...')
+                        if progress_callback:
+                            progress_callback(
+                                text=f"订阅搜索随机休眠 {sleep_time} 秒后继续 ..."
+                            )
                         time.sleep(sleep_time)
                     try:
+                        search_attempted = True
                         logger.info(f'开始搜索订阅，标题：{subscribe.name} ...')
-                        # 生成元数据
-                        meta = MetaInfo(subscribe.name)
-                        meta.year = subscribe.year
-                        meta.begin_season = subscribe.season or None
                         try:
-                            meta.type = MediaType(subscribe.type)
+                            meta = build_subscribe_meta(subscribe)
                         except ValueError:
                             logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
                             continue
                         # 识别媒体信息
-                        mediainfo: MediaInfo = self.recognize_media(meta=meta, mtype=meta.type,
-                                                                    tmdbid=subscribe.tmdbid,
-                                                                    doubanid=subscribe.doubanid,
-                                                                    episode_group=subscribe.episode_group,
-                                                                    cache=False)
+                        mediainfo: MediaInfo = self.recognize_media(
+                            meta=meta,
+                            mtype=meta.type,
+                            **_subscribe_recognize_kwargs(subscribe),
+                            episode_group=subscribe.episode_group,
+                            cache=False,
+                        )
                         if not mediainfo:
                             logger.warn(
                                 f'未识别到媒体信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，doubanid：{subscribe.doubanid}')
@@ -593,14 +1439,43 @@ class SubscribeChain(ChainBase):
 
                                 # 洗版
                                 if subscribe.best_version:
-                                    # 洗版时，非整季不要
+                                    if (
+                                            torrent_mediainfo.type == MediaType.TV
+                                            and not self.__is_full_season_best_version_resource(
+                                        meta=torrent_meta, subscribe=subscribe
+                                    )
+                                    ):
+                                        logger.info(
+                                            f"{subscribe.name} 正在全集洗版，{torrent_info.title} 不是全集资源"
+                                        )
+                                        continue
+                                    # 洗版时，不符合订阅集数的不要
+                                    if (
+                                            torrent_mediainfo.type == MediaType.TV
+                                            and not self._is_episode_range_covered(
+                                        meta=torrent_meta, subscribe=subscribe
+                                    )
+                                    ):
+                                        logger.info(
+                                            f"{subscribe.name} 正在洗版，{torrent_info.title} 不符合订阅集数范围"
+                                        )
+                                        continue
+                                    # 全集洗版按整包准入基线过滤；分集洗版按可提升剧集过滤。
                                     if torrent_mediainfo.type == MediaType.TV:
-                                        if torrent_meta.episode_list:
-                                            logger.info(f'{subscribe.name} 正在洗版，{torrent_info.title} 不是整季')
+                                        if not self.__prepare_best_version_tv_candidate(
+                                                subscribe=subscribe,
+                                                context=context,
+                                                priority=torrent_info.pri_order,
+                                        ):
+                                            logger.info(
+                                                f'{subscribe.name} 正在洗版，{torrent_info.title} '
+                                                f'优先级未达到当前模式的升级条件')
                                             continue
-                                    # 洗版时，优先级小于等于已下载优先级的不要
-                                    if subscribe.current_priority \
-                                            and torrent_info.pri_order <= subscribe.current_priority:
+                                    if (
+                                            torrent_mediainfo.type != MediaType.TV
+                                            and subscribe.current_priority
+                                            and torrent_info.pri_order <= subscribe.current_priority
+                                    ):
                                         logger.info(
                                             f'{subscribe.name} 正在洗版，{torrent_info.title} 优先级低于或等于已下载优先级')
                                         continue
@@ -621,9 +1496,11 @@ class SubscribeChain(ChainBase):
                             continue
 
                         # 自动下载
-                        downloads, lefts = DownloadChain().batch_download(
+                        downloads, lefts = self.__download_best_version_with_full_pack_first(
                             contexts=matched_contexts,
                             no_exists=no_exists,
+                            subscribe=subscribe,
+                            mediakey=mediakey,
                             username=subscribe.username,
                             save_path=subscribe.save_path,
                             downloader=subscribe.downloader,
@@ -639,8 +1516,14 @@ class SubscribeChain(ChainBase):
                                                          downloads=downloads, lefts=lefts)
                     finally:
                         # 如果状态为N则更新为R
-                        if subscribe and subscribe.state == 'N':
+                        if search_attempted and subscribe and subscribe.state == 'N':
                             subscribeoper.update(subscribe.id, {'state': 'R'})
+                        if progress_callback:
+                            progress_callback(
+                                value=index / total_num * 100 if total_num else 100,
+                                text=f"订阅搜索（{index}/{total_num}）处理完成",
+                                data={"total": total_num, "finished": index},
+                            )
 
                 # 手动触发时发送系统消息
                 if manual:
@@ -651,6 +1534,8 @@ class SubscribeChain(ChainBase):
                             self.messagehelper.put('所有订阅搜索完成！', title="订阅搜索", role="system")
                     else:
                         self.messagehelper.put('没有找到订阅！', title="订阅搜索", role="system")
+                if progress_callback:
+                    progress_callback(value=100, text="订阅搜索完成")
 
             finally:
                 subscribes.clear()
@@ -660,26 +1545,30 @@ class SubscribeChain(ChainBase):
                 self._rlock.release()
                 logger.debug(f"search Lock released at {datetime.now()}")
 
-    def update_subscribe_priority(self, subscribe: Subscribe, meta: MetaBase,
-                                  mediainfo: MediaInfo, downloads: Optional[List[Context]]):
+    @staticmethod
+    def __update_movie_download_priority(
+            subscribe: Subscribe,
+            mediainfo: MediaInfo,
+            downloads: Optional[List[Context]],
+    ):
         """
-        更新订阅已下载资源的优先级
+        记录电影本轮下载资源优先级，用作后续电影洗版的起始质量状态。
         """
         if not downloads:
             return
-        if not subscribe.best_version:
-            return
-        # 当前下载资源的优先级
         priority = max([item.torrent_info.pri_order for item in downloads])
-        # 订阅存在待定策略，不管是否已完成，均需更新订阅信息
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        if subscribe.type != MediaType.MOVIE.value:
+            return
+
         SubscribeOper().update(subscribe.id, {
             "current_priority": priority,
-            "last_update": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            "last_update": now
         })
-        if priority == 100:
-            # 洗版完成
-            self.__finish_subscribe(subscribe=subscribe, meta=meta, mediainfo=mediainfo)
-        else:
+        subscribe.current_priority = priority
+        subscribe.last_update = now
+        if subscribe.best_version and priority != 100:
             # 正在洗版，更新资源优先级
             logger.info(f'{mediainfo.title_year} 正在洗版，更新资源优先级为 {priority}')
 
@@ -690,47 +1579,98 @@ class SubscribeChain(ChainBase):
         """
         判断是否应完成订阅
         """
-        mediakey = subscribe.tmdbid or subscribe.doubanid
+        media_keys = _subscribe_media_keys(subscribe)
         # 是否有剩余集
-        no_lefts = not lefts or not lefts.get(mediakey)
+        no_lefts = not lefts or not any(lefts.get(media_key) for media_key in media_keys)
+        if downloads and meta.type == MediaType.TV:
+            self.__record_subscribe_download_facts(subscribe=subscribe, mediainfo=mediainfo, downloads=downloads)
+        elif downloads:
+            self.__update_subscribe_note(subscribe=subscribe, downloads=downloads)
+        if downloads and meta.type == MediaType.MOVIE:
+            self.__update_movie_download_priority(
+                subscribe=subscribe,
+                mediainfo=mediainfo,
+                downloads=downloads,
+            )
         # 是否完成订阅
         if not subscribe.best_version:
-            # 订阅存在待定策略，不管是否已完成，均需更新订阅信息
-            # 更新订阅已下载信息
-            self.__update_subscribe_note(subscribe=subscribe, downloads=downloads)
-            # 更新订阅剩余集数和时间
-            self.__update_lack_episodes(lefts=lefts, subscribe=subscribe, mediainfo=mediainfo,
-                                        update_date=bool(downloads))
-            # 判断是否需要完成订阅
+            # 普通订阅：先按 lefts 写 lack，再判断完成
+            if meta.type == MediaType.TV:
+                self.__refresh_subscribe_progress_with_no_exists(
+                    no_exists=lefts,
+                    subscribe=subscribe,
+                    touch_last_update=bool(downloads),
+                    scene="download",
+                )
             if ((no_lefts and meta.type == MediaType.TV)
                     or (downloads and meta.type == MediaType.MOVIE)
                     or force):
                 self.__finish_subscribe(subscribe=subscribe, meta=meta, mediainfo=mediainfo)
             else:
-                # 未下载到内容且不完整
                 logger.info(f'{mediainfo.title_year} 未下载完整，继续订阅 ...')
-        elif downloads:
-            # 洗版下载到了内容，更新资源优先级
-            self.update_subscribe_priority(subscribe=subscribe, meta=meta,
-                                           mediainfo=mediainfo, downloads=downloads)
-        elif subscribe.current_priority == 100:
+            return
+
+        if meta.type == MediaType.TV:
+            self.__refresh_subscribe_progress_with_no_exists(
+                no_exists=lefts,
+                subscribe=subscribe,
+                touch_last_update=bool(downloads),
+                scene="download",
+            )
+        if self.__is_best_version_complete(subscribe):
             # 洗版完成
             self.__finish_subscribe(subscribe=subscribe, meta=meta, mediainfo=mediainfo)
-        else:
-            # 洗版，未下载到内容
+        elif not downloads:
             logger.info(f'{mediainfo.title_year} 继续洗版 ...')
 
-    def refresh(self):
+    def refresh(self, progress_callback: Optional[Callable[..., None]] = None) -> None:
         """
         订阅刷新
+
+        :param progress_callback: 定时服务进度更新回调
         """
         # 触发刷新站点资源，从缓存中匹配订阅
         sites = self.get_subscribed_sites()
         if sites is None:
+            if progress_callback:
+                progress_callback(value=100, text="没有订阅需要刷新")
             return
-        self.match(
-            TorrentsChain().refresh(sites=sites)
+        def _update_refresh_progress(
+                value: Optional[float] = None,
+                text: Optional[str] = None,
+                data: Optional[dict] = None,
+        ) -> None:
+            """将站点刷新进度映射到订阅刷新的前半阶段。"""
+            if progress_callback:
+                progress_callback(
+                    value=(value or 0) * 0.6,
+                    text=text,
+                    data=data,
+                )
+
+        def _update_match_progress(
+                value: Optional[float] = None,
+                text: Optional[str] = None,
+                data: Optional[dict] = None,
+        ) -> None:
+            """将订阅匹配进度映射到订阅刷新的后半阶段。"""
+            if progress_callback:
+                progress_callback(
+                    value=60 + (value or 0) * 0.4,
+                    text=text,
+                    data=data,
+                )
+
+        torrents = TorrentsChain().refresh(
+            sites=sites,
+            progress_callback=_update_refresh_progress if progress_callback else None,
         )
+        self.match(
+            torrents,
+            progress_callback=_update_match_progress if progress_callback else None,
+        )
+        if progress_callback:
+            progress_callback(value=100, text="订阅刷新完成")
 
     @staticmethod
     def get_sub_sites(subscribe: Subscribe) -> List[int]:
@@ -775,13 +1715,25 @@ class SubscribeChain(ChainBase):
 
         return ret_sites
 
-    def match(self, torrents: Dict[str, List[Context]]):
+    def match(
+            self,
+            torrents: Dict[str, List[Context]],
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> None:
         """
         从缓存中匹配订阅，并自动下载
+
+        :param torrents: 按站点分组的资源上下文
+        :param progress_callback: 订阅匹配进度更新回调
         """
         if not torrents:
             logger.warn('没有缓存资源，无法匹配订阅')
+            if progress_callback:
+                progress_callback(value=100, text="没有缓存资源，跳过订阅匹配")
             return
+
+        if progress_callback:
+            progress_callback(value=0, text="正在预处理订阅资源 ...")
 
         lock_acquired = False
         try:
@@ -802,16 +1754,26 @@ class SubscribeChain(ChainBase):
                     if global_vars.is_system_stopped:
                         break
                     # 如果种子未识别且失败次数未超过3次，尝试识别
-                    if (not context.media_info or (not context.media_info.tmdb_id
-                                                   and not context.media_info.douban_id)) and context.media_recognize_fail_count < 3:
+                    if (
+                            not context.media_info
+                            or not resolve_media_identity(media=context.media_info)[1]
+                    ) and context.media_recognize_fail_count < 3:
                         logger.debug(
                             f'尝试重新识别种子：{context.torrent_info.title}，当前失败次数：{context.media_recognize_fail_count}/3')
-                        re_mediainfo = self.recognize_media(meta=context.meta_info)
+                        re_mediainfo = MediaChain().recognize_by_meta(
+                            context.meta_info,
+                            obtain_images=False,
+                        )
                         if re_mediainfo:
                             # 清理多余信息
                             re_mediainfo.clear()
                             # 更新种子缓存
                             context.media_info = re_mediainfo
+                            context.match_source = self.__get_media_id_match_source(re_mediainfo)
+                            context.candidate_recognized = bool(
+                                resolve_media_identity(media=re_mediainfo)[1]
+                            )
+                            context.media_info_is_target = False
                             # 重置失败次数
                             context.media_recognize_fail_count = 0
                             logger.debug(f'种子 {context.torrent_info.title} 重新识别成功')
@@ -827,18 +1789,36 @@ class SubscribeChain(ChainBase):
 
             # 所有订阅
             subscribes = SubscribeOper().list(self.get_states_for_search('R'))
+            total_num = len(subscribes)
+            if progress_callback:
+                progress_callback(
+                    value=20,
+                    text=f"资源预处理完成，开始匹配 {total_num} 个订阅 ...",
+                    data={"total": total_num, "finished": 0},
+                )
             try:
-                for subscribe in subscribes:
+                for index, subscribe in enumerate(subscribes, start=1):
                     if global_vars.is_system_stopped:
                         break
+                    if progress_callback:
+                        progress_callback(
+                            value=20 + (
+                                (index - 1) / total_num * 80 if total_num else 80
+                            ),
+                            text=(
+                                f"正在匹配订阅（{index}/{total_num}）"
+                                f"{subscribe.name} ..."
+                            ),
+                            data={
+                                "total": total_num,
+                                "finished": index - 1,
+                                "current": subscribe.id,
+                            },
+                        )
                     logger.info(f'开始匹配订阅，标题：{subscribe.name} ...')
-                    mediakey = subscribe.tmdbid or subscribe.doubanid
-                    # 生成元数据
-                    meta = MetaInfo(subscribe.name)
-                    meta.year = subscribe.year
-                    meta.begin_season = subscribe.season or None
+                    mediakey = _subscribe_media_key(subscribe)
                     try:
-                        meta.type = MediaType(subscribe.type)
+                        meta = build_subscribe_meta(subscribe)
                     except ValueError:
                         logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
                         continue
@@ -847,11 +1827,13 @@ class SubscribeChain(ChainBase):
                     if subscribe.sites:
                         domains = SiteOper().get_domains_by_ids(subscribe.sites)
                     # 识别媒体信息
-                    mediainfo: MediaInfo = self.recognize_media(meta=meta, mtype=meta.type,
-                                                                tmdbid=subscribe.tmdbid,
-                                                                doubanid=subscribe.doubanid,
-                                                                episode_group=subscribe.episode_group,
-                                                                cache=False)
+                    mediainfo: MediaInfo = self.recognize_media(
+                        meta=meta,
+                        mtype=meta.type,
+                        **_subscribe_recognize_kwargs(subscribe),
+                        episode_group=subscribe.episode_group,
+                        cache=False,
+                    )
                     if not mediainfo:
                         logger.warn(
                             f'未识别到媒体信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，doubanid：{subscribe.doubanid}')
@@ -913,20 +1895,29 @@ class SubscribeChain(ChainBase):
                                     # 更新元数据缓存
                                     _context.meta_info = torrent_meta
                                     # 重新识别媒体信息
-                                    torrent_mediainfo = self.recognize_media(meta=torrent_meta,
-                                                                             episode_group=subscribe.episode_group)
+                                    torrent_mediainfo = MediaChain().recognize_by_meta(
+                                        torrent_meta,
+                                        episode_group=subscribe.episode_group,
+                                        obtain_images=False,
+                                    )
                                     if torrent_mediainfo:
                                         # 清理多余信息
                                         torrent_mediainfo.clear()
                                         # 更新种子缓存
                                         _context.media_info = torrent_mediainfo
+                                        _context.match_source = self.__get_media_id_match_source(torrent_mediainfo)
+                                        _context.candidate_recognized = bool(
+                                            resolve_media_identity(media=torrent_mediainfo)[1]
+                                        )
+                                        _context.media_info_is_target = False
 
                             # 如果仍然没有识别到媒体信息，尝试标题匹配
-                            if not torrent_mediainfo or (
-                                    not torrent_mediainfo.tmdb_id and not torrent_mediainfo.douban_id):
+                            if not torrent_mediainfo or not resolve_media_identity(
+                                    media=torrent_mediainfo
+                            )[1]:
                                 logger.debug(
                                     f'{torrent_info.site_name} - {torrent_info.title} 重新识别失败，尝试通过标题匹配...')
-                                if torrenthelper.match_torrent(mediainfo=mediainfo,
+                                if TorrentHelper.match_torrent(mediainfo=mediainfo,
                                                                torrent_meta=torrent_meta,
                                                                torrent=torrent_info):
                                     # 匹配成功
@@ -935,11 +1926,16 @@ class SubscribeChain(ChainBase):
                                     torrent_mediainfo = mediainfo
                                     # 更新种子缓存
                                     _context.media_info = mediainfo
+                                    _context.match_source = "title"
+                                    _context.candidate_recognized = False
+                                    _context.media_info_is_target = True
                                 else:
                                     continue
 
                             # 直接比对媒体信息
-                            if torrent_mediainfo and (torrent_mediainfo.tmdb_id or torrent_mediainfo.douban_id):
+                            if torrent_mediainfo and resolve_media_identity(
+                                    media=torrent_mediainfo
+                            )[1]:
                                 if torrent_mediainfo.type != mediainfo.type:
                                     continue
                                 if torrent_mediainfo.tmdb_id \
@@ -950,6 +1946,18 @@ class SubscribeChain(ChainBase):
                                     continue
                                 logger.info(
                                     f'{mediainfo.title_year} 通过媒体ID匹配到可选资源：{torrent_info.site_name} - {torrent_info.title}')
+                                match_source = _context.match_source
+                                if match_source == "title":
+                                    # 标题兜底使用的是订阅目标 media_info，不能标记为候选自身识别结果。
+                                    _context.candidate_recognized = False
+                                    _context.media_info_is_target = True
+                                elif match_source == "unknown":
+                                    _context.match_source = self.__get_media_id_match_source(torrent_mediainfo)
+                                    _context.candidate_recognized = True
+                                    _context.media_info_is_target = False
+                                else:
+                                    _context.candidate_recognized = True
+                                    _context.media_info_is_target = False
                             else:
                                 continue
 
@@ -960,7 +1968,7 @@ class SubscribeChain(ChainBase):
                                     logger.debug(f'{torrent_info.title} 有多季，不处理')
                                     continue
                                 # 比对季
-                                if torrent_meta.begin_season:
+                                if torrent_meta.begin_season is not None:
                                     if meta.begin_season != torrent_meta.begin_season:
                                         logger.debug(f'{torrent_info.title} 季不匹配')
                                         continue
@@ -985,11 +1993,26 @@ class SubscribeChain(ChainBase):
                                                 )
                                                 continue
                                 else:
-                                    # 洗版时，非整季不要
-                                    if meta.type == MediaType.TV:
-                                        if torrent_meta.episode_list:
-                                            logger.debug(f'{subscribe.name} 正在洗版，{torrent_info.title} 不是整季')
-                                            continue
+                                    if not self.__is_full_season_best_version_resource(
+                                            meta=torrent_meta,
+                                            subscribe=subscribe,
+                                    ):
+                                        logger.debug(
+                                            f"{subscribe.name} 正在全集洗版，{torrent_info.title} 不是全集资源"
+                                        )
+                                        continue
+                                    # 洗版时，不符合订阅集数的不要
+                                    if (
+                                            meta.type == MediaType.TV
+                                            and not self._is_episode_range_covered(
+                                        meta=torrent_meta,
+                                        subscribe=subscribe,
+                                    )
+                                    ):
+                                        logger.debug(
+                                            f"{subscribe.name} 正在洗版，{torrent_info.title} 不符合订阅集数范围"
+                                        )
+                                        continue
 
                             # 匹配订阅附加参数
                             if not torrenthelper.filter_torrent(torrent_info=torrent_info,
@@ -1014,8 +2037,21 @@ class SubscribeChain(ChainBase):
 
                             # 洗版时，优先级小于已下载优先级的不要
                             if subscribe.best_version:
-                                if subscribe.current_priority \
-                                        and torrent_info.pri_order <= subscribe.current_priority:
+                                if meta.type == MediaType.TV:
+                                    if not self.__prepare_best_version_tv_candidate(
+                                            subscribe=subscribe,
+                                            context=_context,
+                                            priority=torrent_info.pri_order,
+                                    ):
+                                        logger.info(
+                                            f'{subscribe.name} 正在洗版，{torrent_info.title} '
+                                            f'优先级未达到当前模式的升级条件')
+                                        continue
+                                if (
+                                        meta.type != MediaType.TV
+                                        and subscribe.current_priority
+                                        and torrent_info.pri_order <= subscribe.current_priority
+                                ):
                                     logger.info(
                                         f'{subscribe.name} 正在洗版，{torrent_info.title} 优先级低于或等于已下载优先级')
                                     continue
@@ -1038,14 +2074,16 @@ class SubscribeChain(ChainBase):
 
                     # 开始批量择优下载
                     logger.info(f'{mediainfo.title_year} 匹配完成，共匹配到{len(_match_context)}个资源')
-                    downloads, lefts = DownloadChain().batch_download(contexts=_match_context,
-                                                                      no_exists=no_exists,
-                                                                      username=subscribe.username,
-                                                                      save_path=subscribe.save_path,
-                                                                      downloader=subscribe.downloader,
-                                                                      source=self.get_subscribe_source_keyword(
-                                                                          subscribe)
-                                                                      )
+                    downloads, lefts = self.__download_best_version_with_full_pack_first(
+                        contexts=_match_context,
+                        no_exists=no_exists,
+                        subscribe=subscribe,
+                        mediakey=mediakey,
+                        username=subscribe.username,
+                        save_path=subscribe.save_path,
+                        downloader=subscribe.downloader,
+                        source=self.get_subscribe_source_keyword(subscribe)
+                    )
 
                     # 同步外部修改，更新订阅信息
                     subscribe = SubscribeOper().get(subscribe.id)
@@ -1059,53 +2097,109 @@ class SubscribeChain(ChainBase):
                 del processed_torrents
                 subscribes.clear()
                 del subscribes
+                if progress_callback:
+                    progress_callback(
+                        value=100,
+                        text="订阅资源匹配完成",
+                        data={"total": total_num, "finished": total_num},
+                    )
         finally:
             if lock_acquired:
                 self._rlock.release()
                 logger.debug(f"match Lock released at {datetime.now()}")
 
-    def check(self):
+    def check(self, progress_callback: Optional[Callable[..., None]] = None) -> None:
         """
         定时检查订阅，更新订阅信息
+
+        :param progress_callback: 定时服务进度更新回调
         """
         # 查询所有订阅
         subscribeoper = SubscribeOper()
+        subscribes = subscribeoper.list()
+        total_num = len(subscribes)
+        if progress_callback:
+            progress_callback(
+                value=0,
+                text=f"开始更新订阅元数据，共 {total_num} 个订阅 ...",
+                data={"total": total_num, "finished": 0},
+            )
         # 遍历订阅
-        for subscribe in subscribeoper.list():
+        for index, subscribe in enumerate(subscribes, start=1):
             if global_vars.is_system_stopped:
                 break
             logger.info(f'开始更新订阅元数据：{subscribe.name} ...')
-            # 生成元数据
-            meta = MetaInfo(subscribe.name)
-            meta.year = subscribe.year
-            meta.begin_season = subscribe.season or None
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在更新订阅元数据（{index}/{total_num}）{subscribe.name} ...",
+                    data={
+                        "total": total_num,
+                        "finished": index - 1,
+                        "current": subscribe.id,
+                    },
+                )
             try:
-                meta.type = MediaType(subscribe.type)
+                meta = build_subscribe_meta(subscribe)
             except ValueError:
                 logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
                 continue
             # 识别媒体信息
-            mediainfo: MediaInfo = self.recognize_media(meta=meta, mtype=meta.type,
-                                                        tmdbid=subscribe.tmdbid,
-                                                        doubanid=subscribe.doubanid,
-                                                        episode_group=subscribe.episode_group,
-                                                        cache=False)
+            mediainfo: MediaInfo = self.recognize_media(
+                meta=meta,
+                mtype=meta.type,
+                **_subscribe_recognize_kwargs(subscribe),
+                episode_group=subscribe.episode_group,
+                cache=False,
+            )
             if not mediainfo:
                 logger.warn(
                     f'未识别到媒体信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，doubanid：{subscribe.doubanid}')
                 continue
             # 对于电视剧，获取当前季的总集数
             episodes = mediainfo.seasons.get(subscribe.season) or []
-            if not subscribe.manual_total_episode and len(episodes):
-                total_episode = len(episodes)
-                lack_episode = subscribe.lack_episode + (total_episode - subscribe.total_episode)
+            progress_update = {}
+            if subscribe.type == MediaType.TV.value and not subscribe.manual_total_episode and len(episodes):
+                current_total_episode = len(episodes)
+                # 外部事件只能向上覆盖主程序本次识别到的 TMDB 当前季总集数，已有订阅按最终 total 跟随持久化。
+                total_episode = self.__apply_episodes_refresh(
+                    current_total_episode, season=subscribe.season, mediainfo=mediainfo,
+                    tmdbid=subscribe.tmdbid, doubanid=subscribe.doubanid,
+                    bangumiid=subscribe.bangumiid,
+                    anilistid=subscribe.anilistid,
+                    media_source=subscribe.media_source,
+                    media_id=subscribe.media_id,
+                    subscribe_id=subscribe.id, scene="refresh")
+                old_total_episode = subscribe.total_episode or 0
+                if total_episode and total_episode < old_total_episode:
+                    total_episode = self.__resolve_total_episode_decrease(
+                        subscribe=subscribe,
+                        candidate_total=total_episode,
+                        meta=meta,
+                        mediainfo=mediainfo,
+                        mediakey=_subscribe_media_key(subscribe),
+                    )
+                if total_episode and total_episode != old_total_episode:
+                    progress_update = self.__prepare_total_episode_change_fields(
+                        subscribe=subscribe,
+                        total_episode=total_episode,
+                        old_total_episode=old_total_episode,
+                    )
+                else:
+                    total_episode = subscribe.total_episode
+                    progress_update = {"lack_episode": subscribe.lack_episode}
+                    if subscribe.best_version and subscribe.type == MediaType.TV.value:
+                        progress_update = self.__prepare_subscribe_progress_fields(subscribe=subscribe, no_exists={})
                 logger.info(
-                    f'订阅 {subscribe.name} 总集数变化，更新总集数为{total_episode}，缺失集数为{lack_episode} ...')
+                    f'订阅 {subscribe.name} 总集数变化，更新总集数为{total_episode}，'
+                    f'缺失集数为{progress_update.get("lack_episode", subscribe.lack_episode)} ...')
             else:
                 total_episode = subscribe.total_episode
-                lack_episode = subscribe.lack_episode
+                progress_update = {"lack_episode": subscribe.lack_episode}
+                if subscribe.best_version and subscribe.type == MediaType.TV.value:
+                    progress_update = self.__prepare_subscribe_progress_fields(subscribe=subscribe, no_exists={})
             # 更新TMDB信息
-            subscribeoper.update(subscribe.id, {
+            update_data = {
                 "name": mediainfo.title,
                 "year": mediainfo.year,
                 "vote": mediainfo.vote_average,
@@ -1114,10 +2208,27 @@ class SubscribeChain(ChainBase):
                 "description": mediainfo.overview,
                 "imdbid": mediainfo.imdb_id,
                 "tvdbid": mediainfo.tvdb_id,
+                "tmdbid": mediainfo.tmdb_id,
+                "doubanid": mediainfo.douban_id,
+                "bangumiid": mediainfo.bangumi_id,
+                "anilistid": mediainfo.anilist_id,
+                "media_source": resolve_media_identity(media=mediainfo)[0],
+                "media_id": resolve_media_identity(media=mediainfo)[1],
                 "total_episode": total_episode,
-                "lack_episode": lack_episode
-            })
+            }
+            update_data.update(progress_update)
+            for key, value in progress_update.items():
+                setattr(subscribe, key, value)
+            subscribeoper.update(subscribe.id, update_data)
             logger.info(f'{subscribe.name} 订阅元数据更新完成')
+            if progress_callback:
+                progress_callback(
+                    value=index / total_num * 100 if total_num else 100,
+                    text=f"订阅元数据（{index}/{total_num}）更新完成",
+                    data={"total": total_num, "finished": index},
+                )
+        if progress_callback:
+            progress_callback(value=100, text="订阅元数据更新完成")
 
     def get_subscribe_by_source(self, source: str) -> Optional[Subscribe]:
         """
@@ -1127,36 +2238,69 @@ class SubscribeChain(ChainBase):
         if not source_keyword:
             return None
         # 只保留需要的字段动态获取订阅
-        valid_fields = {k: v for k, v in source_keyword.items()
-                        if k in ["type", "season", "tmdbid", "doubanid", "bangumiid"]}
+        valid_fields = {
+            k: v for k, v in source_keyword.items()
+            if k in [
+                "type", "season", "tmdbid", "doubanid", "bangumiid",
+                "anilistid", "media_source", "media_id",
+            ]
+        }
         # 暂时不考虑订阅历史, 若有必要再添加
         return SubscribeOper().get_by(**valid_fields)
 
     @staticmethod
-    def follow():
+    def follow(progress_callback: Optional[Callable[..., None]] = None) -> None:
         """
         刷新follow的用户分享，并自动添加订阅
+
+        :param progress_callback: 定时服务进度更新回调
         """
         follow_users: List[str] = SystemConfigOper().get(SystemConfigKey.FollowSubscribers)
         if not follow_users:
+            if progress_callback:
+                progress_callback(value=100, text="未配置 Follow 订阅用户，跳过刷新")
             return
         logger.info(f'开始刷新follow用户分享订阅 ...')
         success_count = 0
         subscribeoper = SubscribeOper()
-        for share_sub in SubscribeHelper().get_shares():
+        share_subscribes = MoviePilotServerHelper.get_subscribe_shares() or []
+        total_num = len(share_subscribes)
+        if progress_callback:
+            progress_callback(
+                value=0,
+                text=f"开始刷新 Follow 订阅分享，共 {total_num} 条 ...",
+                data={"total": total_num, "finished": 0},
+            )
+        for index, share_sub in enumerate(share_subscribes, start=1):
             if global_vars.is_system_stopped:
                 break
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在处理 Follow 订阅分享（{index}/{total_num}）...",
+                    data={"total": total_num, "finished": index - 1},
+                )
             uid = share_sub.get("share_uid")
             if uid and uid in follow_users:
                 # 订阅已存在则跳过
                 if subscribeoper.exists(tmdbid=share_sub.get("tmdbid"),
                                         doubanid=share_sub.get("doubanid"),
-                                        season=share_sub.get("season")):
+                                        bangumiid=share_sub.get("bangumiid"),
+                                        anilistid=share_sub.get("anilistid"),
+                                        media_source=share_sub.get("media_source"),
+                                        media_id=share_sub.get("media_id"),
+                                        season=share_sub.get("season"),
+                                        episode_group=share_sub.get("episode_group")):
                     continue
                 # 已经订阅过跳过
                 if subscribeoper.exist_history(tmdbid=share_sub.get("tmdbid"),
                                                doubanid=share_sub.get("doubanid"),
-                                               season=share_sub.get("season")):
+                                               bangumiid=share_sub.get("bangumiid"),
+                                               anilistid=share_sub.get("anilistid"),
+                                               media_source=share_sub.get("media_source"),
+                                               media_id=share_sub.get("media_id"),
+                                               season=share_sub.get("season"),
+                                               episode_group=share_sub.get("episode_group")):
                     continue
                 # 去除无效属性
                 for key in list(share_sub.keys()):
@@ -1166,10 +2310,17 @@ class SubscribeChain(ChainBase):
                 subscribe_in = schemas.Subscribe(**share_sub)
                 mtype = MediaType(subscribe_in.type)
                 # 豆瓣标题处理
-                if subscribe_in.doubanid or subscribe_in.bangumiid:
+                if (
+                        subscribe_in.doubanid
+                        or subscribe_in.bangumiid
+                        or subscribe_in.anilistid
+                        or normalize_media_source(subscribe_in.media_source)
+                        not in (None, "themoviedb")
+                ):
                     meta = MetaInfo(subscribe_in.name)
                     subscribe_in.name = meta.name
-                    subscribe_in.season = meta.begin_season
+                    if subscribe_in.season is None:
+                        subscribe_in.season = meta.begin_season
                 # 标题转换
                 if subscribe_in.name:
                     title = subscribe_in.name
@@ -1180,8 +2331,12 @@ class SubscribeChain(ChainBase):
                                                     year=subscribe_in.year,
                                                     tmdbid=subscribe_in.tmdbid,
                                                     season=subscribe_in.season,
+                                                    episode_group=subscribe_in.episode_group,
                                                     doubanid=subscribe_in.doubanid,
                                                     bangumiid=subscribe_in.bangumiid,
+                                                    anilistid=subscribe_in.anilistid,
+                                                    media_source=subscribe_in.media_source,
+                                                    media_id=subscribe_in.media_id,
                                                     username="订阅分享",
                                                     best_version=subscribe_in.best_version,
                                                     save_path=subscribe_in.save_path,
@@ -1196,42 +2351,83 @@ class SubscribeChain(ChainBase):
                 else:
                     logger.error(f'follow用户分享订阅 {title} 添加失败：{message}')
         logger.info(f'follow用户分享订阅刷新完成，共添加 {success_count} 个订阅')
+        if progress_callback:
+            progress_callback(
+                value=100,
+                text=f"Follow 订阅分享刷新完成，新增 {success_count} 个订阅",
+                data={
+                    "total": total_num,
+                    "finished": total_num,
+                    "added": success_count,
+                },
+            )
 
-    async def cache_calendar(self):
+    async def cache_calendar(
+            self,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> None:
         """
         预缓存订阅日历，实际上就是查询一遍所有订阅的媒体信息
         前端请示是异常的，所以需要使用异步缓存方法
+
+        :param progress_callback: 定时服务进度更新回调
         """
         logger.info(f'开始预缓存订阅日历 ...')
-        for subscribe in await SubscribeOper().async_list():
+        subscribes = await SubscribeOper().async_list()
+        total_num = len(subscribes)
+        if progress_callback:
+            progress_callback(
+                value=0,
+                text=f"开始预缓存订阅日历，共 {total_num} 个订阅 ...",
+                data={"total": total_num, "finished": 0},
+            )
+        for index, subscribe in enumerate(subscribes, start=1):
             if global_vars.is_system_stopped:
                 break
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在预缓存订阅日历（{index}/{total_num}）{subscribe.name} ...",
+                    data={
+                        "total": total_num,
+                        "finished": index - 1,
+                        "current": subscribe.id,
+                    },
+                )
             try:
                 mtype = MediaType(subscribe.type)
             except ValueError:
                 logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
                 continue
-            # 识别媒体信息
-            if mtype == MediaType.MOVIE:
-                mediainfo: MediaInfo = await self.async_recognize_media(mtype=mtype,
-                                                                        tmdbid=subscribe.tmdbid,
-                                                                        doubanid=subscribe.doubanid,
-                                                                        bangumiid=subscribe.bangumiid,
-                                                                        episode_group=subscribe.episode_group,
-                                                                        cache=False)
-                if not mediainfo:
-                    logger.warn(
-                        f'未识别到媒体信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，doubanid：{subscribe.doubanid}')
-                    continue
-            else:
-                episodes = await TmdbChain().async_tmdb_episodes(tmdbid=subscribe.tmdbid,
+            # 先按订阅的主媒体身份预热对应数据源，再对 TMDB 额外预热分集接口。
+            mediainfo: MediaInfo = await self.async_recognize_media(
+                mtype=mtype,
+                **_subscribe_recognize_kwargs(subscribe),
+                episode_group=subscribe.episode_group,
+                cache=False,
+            )
+            if not mediainfo:
+                logger.warn(
+                    f'未识别到媒体信息，标题：{subscribe.name}，'
+                    f'媒体源：{subscribe.media_source}，媒体ID：{subscribe.media_id}')
+                continue
+            if mtype == MediaType.TV and mediainfo.source == "themoviedb" and mediainfo.tmdb_id:
+                episodes = await TmdbChain().async_tmdb_episodes(tmdbid=mediainfo.tmdb_id,
                                                                  season=subscribe.season,
                                                                  episode_group=subscribe.episode_group)
                 if not episodes:
                     logger.warn(
-                        f'未识别到季集信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，豆瓣ID：{subscribe.doubanid}，季：{subscribe.season}')
+                        f'未识别到季集信息，标题：{subscribe.name}，tmdbid：{mediainfo.tmdb_id}，季：{subscribe.season}')
                     continue
+            if progress_callback:
+                progress_callback(
+                    value=index / total_num * 100 if total_num else 100,
+                    text=f"订阅日历（{index}/{total_num}）预缓存完成",
+                    data={"total": total_num, "finished": index},
+                )
         logger.info(f'订阅日历预缓存完成')
+        if progress_callback:
+            progress_callback(value=100, text="订阅日历预缓存完成")
 
     @staticmethod
     def __update_subscribe_note(subscribe: Subscribe, downloads: Optional[List[Context]]):
@@ -1253,6 +2449,21 @@ class SubscribeChain(ChainBase):
             if subscribe.doubanid and mediainfo.douban_id \
                     and mediainfo.douban_id != subscribe.doubanid:
                 continue
+            subscribe_bangumiid = subscribe.bangumiid
+            media_bangumiid = mediainfo.bangumi_id
+            if subscribe_bangumiid and media_bangumiid \
+                    and media_bangumiid != subscribe_bangumiid:
+                continue
+            subscribe_anilistid = subscribe.anilistid
+            media_anilistid = mediainfo.anilist_id
+            if subscribe_anilistid and media_anilistid \
+                    and media_anilistid != subscribe_anilistid:
+                continue
+            subscribe_source, subscribe_media_id = resolve_media_identity(media=subscribe)
+            media_source, media_id = resolve_media_identity(media=mediainfo)
+            if subscribe_source == media_source and subscribe_media_id and media_id \
+                    and subscribe_media_id != media_id:
+                continue
             items = []
             if mediainfo.type == MediaType.TV:
                 # 电视剧有集数，使用 episode_list
@@ -1273,9 +2484,18 @@ class SubscribeChain(ChainBase):
     @staticmethod
     def __get_downloaded(subscribe: Subscribe) -> List[int]:
         """
-        获取已下载过的集数或电影
+        获取已下载过的集数或电影。
+
+        洗版分支只返回 priority==100 的完成集；priority<100 的集仍要继续搜索更高
+        优先级版本，不能并入返回值（会让下游把 pending 减空、订阅卡死）。
+        note 由非洗版分支消费，用于洗版关闭后的迁移读取。
         """
         if subscribe.best_version:
+            if subscribe.type == MediaType.TV.value:
+                completed = SubscribeChain.__get_best_version_completed_episodes(subscribe)
+                if completed:
+                    logger.info(f'订阅 {subscribe.name} 第{subscribe.season}季 已完成洗版剧集：{completed}')
+                return completed
             return []
         note = subscribe.note or []
         if not note:
@@ -1290,41 +2510,304 @@ class SubscribeChain(ChainBase):
             return note
         return []
 
-    @staticmethod
-    def __update_lack_episodes(lefts: Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]],
-                               subscribe: Subscribe,
-                               mediainfo: MediaInfo,
-                               update_date: Optional[bool] = False):
+    @classmethod
+    def __prepare_subscribe_progress_fields(
+            cls,
+            subscribe: Subscribe,
+            no_exists: Optional[Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]]] = None,
+            touch_last_update: Optional[bool] = False,
+    ) -> Dict[str, Any]:
         """
-        更新订阅剩余集数及时间
+        准备订阅进度持久化字段。
+
+        该方法只返回待写字段，不主动写库。普通电视剧的 no_exists 为空时表示当前缺失结果为空；
+        洗版电视剧按 note 与 episode_priority 计算未下载过任何版本的目标集数量。
         """
-        update_data = {}
-        if update_date:
-            update_data["last_update"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        update_data: Dict[str, Any] = {}
         if subscribe.type == MediaType.TV.value:
-            if not lefts:
-                # 如果 lefts 为空，表示没有缺失集数，直接设置 lack_episode 为 0
-                lack_episode = 0
-                logger.info(f'{mediainfo.title_year} 没有缺失集数，直接更新为 0 ...')
-            else:
-                mediakey = subscribe.tmdbid or subscribe.doubanid
-                left_seasons = lefts.get(mediakey)
-                lack_episode = 0
-                if left_seasons:
-                    for season_info in left_seasons.values():
-                        season = season_info.season
-                        if season == subscribe.season:
-                            left_episodes = season_info.episodes
-                            if not left_episodes:
-                                lack_episode = season_info.total_episode
-                            else:
-                                lack_episode = len(left_episodes)
-                            logger.info(f"{mediainfo.title_year} 季 {season} 更新缺失集数为{lack_episode} ...")
-                            break
-            update_data["lack_episode"] = lack_episode
-        # 更新数据库
+            if no_exists is None and not subscribe.best_version:
+                no_exists = {}
+            update_data["lack_episode"] = cls.compute_lack_episode(subscribe, no_exists=no_exists)
+            if subscribe.best_version and not cls.__is_full_best_version_enabled(subscribe):
+                update_data["current_priority"] = cls.get_best_version_current_priority(subscribe)
+        if update_data and touch_last_update:
+            update_data["last_update"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return update_data
+
+    @staticmethod
+    def __apply_subscribe_update(subscribe: Subscribe, update_data: Dict[str, Any]) -> None:
+        """
+        写入订阅字段并同步当前内存对象，保证后续事件和判断读取最终快照。
+        """
+        if not update_data:
+            return
+        SubscribeOper().update(subscribe.id, update_data)
+        for key, value in update_data.items():
+            setattr(subscribe, key, value)
+
+    def __refresh_subscribe_progress_with_no_exists(
+            self,
+            subscribe: Subscribe,
+            no_exists: Optional[Dict[Union[int, str], Dict[int, schemas.NotExistMediaInfo]]] = None,
+            touch_last_update: Optional[bool] = False,
+            scene: str = "download",
+    ) -> Dict[str, Any]:
+        """
+        使用已解析的缺失信息刷新订阅进度，避免下载链路重复查询媒体库。
+        """
+        old_lack_episode = subscribe.lack_episode
+        old_current_priority = subscribe.current_priority
+        update_data = self.__prepare_subscribe_progress_fields(
+            subscribe=subscribe,
+            no_exists=no_exists,
+            touch_last_update=touch_last_update,
+        )
+        if not update_data:
+            return {"scene": scene, "updated": False, "fields": [], "reason": "unsupported_subscribe_type"}
+
+        self.__apply_subscribe_update(subscribe, update_data)
+        logger.info(
+            f"订阅 {subscribe.id} 进度刷新：scene={scene}，fields={list(update_data)}，"
+            f"lack_episode {old_lack_episode}->{subscribe.lack_episode}，"
+            f"current_priority {old_current_priority}->{subscribe.current_priority}，reason=updated"
+        )
+        return {
+            "scene": scene,
+            "updated": True,
+            "fields": list(update_data),
+            "lack_episode": update_data.get("lack_episode", subscribe.lack_episode),
+            "current_priority": update_data.get("current_priority", subscribe.current_priority),
+            "reason": "updated",
+        }
+
+    def refresh_subscribe_progress(self, subscribe: Subscribe, *, scene: str = "update") -> Dict[str, Any]:
+        """
+        按主程序口径重新计算并持久化订阅进度。
+        """
+        if subscribe.type != MediaType.TV.value:
+            return {"scene": scene, "updated": False, "fields": [], "reason": "unsupported_subscribe_type"}
+
+        no_exists = None
+        mediainfo = None
+        if not subscribe.best_version:
+            meta = build_subscribe_meta(subscribe)
+            mediainfo = self.recognize_media(
+                meta=meta,
+                mtype=meta.type,
+                **_subscribe_recognize_kwargs(subscribe),
+                episode_group=subscribe.episode_group,
+                cache=False,
+            )
+            if not mediainfo:
+                return {"scene": scene, "updated": False, "fields": [], "reason": "recognize_failed"}
+            mediakey = _subscribe_media_key(subscribe)
+            exist_flag, no_exists = self.resolve_subscribe_missing(
+                subscribe=subscribe,
+                meta=meta,
+                mediainfo=mediainfo,
+                mediakey=mediakey,
+            )
+            if not exist_flag and not no_exists:
+                return {"scene": scene, "updated": False, "fields": [], "reason": "resolve_missing_failed"}
+
+        return self.__refresh_subscribe_progress_with_no_exists(
+            subscribe=subscribe,
+            no_exists=no_exists,
+            touch_last_update=False,
+            scene=scene,
+        )
+
+    def backfill_existing_episodes(
+            self,
+            subscribe: Subscribe,
+            episodes: List[Union[int, str]],
+            priority: Optional[int] = None,
+            scene: str = "backfill",
+    ) -> Dict[str, Any]:
+        """
+        将媒体库既有剧集补写为订阅下载事实，并按需刷新进度字段。
+        """
+        accepted = []
+        ignored = []
+        priority_updated = []
+        priority_ignored = []
+        target_episodes = set(self.__get_best_version_target_episodes(subscribe))
+        note = sorted({int(episode) for episode in subscribe.note or [] if str(episode).isdigit()})
+        note_set = set(note)
+        priority_episodes = set()
+
+        for episode in episodes or []:
+            try:
+                episode_number = int(episode)
+            except (TypeError, ValueError):
+                ignored.append({"episode": episode, "reason": "invalid"})
+                continue
+            if episode_number not in target_episodes:
+                ignored.append({"episode": episode, "reason": "out_of_range"})
+                continue
+            if episode_number in note_set:
+                ignored.append({"episode": episode, "reason": "duplicate"})
+                priority_episodes.add(episode_number)
+                continue
+            accepted.append(episode_number)
+            note_set.add(episode_number)
+            priority_episodes.add(episode_number)
+
+        summary: Dict[str, Any] = {
+            "scene": scene,
+            "accepted": accepted,
+            "ignored": ignored,
+            "priority_updated": priority_updated,
+            "priority_ignored": priority_ignored,
+            "fields": [],
+        }
+        update_data: Dict[str, Any] = {}
+        if accepted:
+            note = sorted(note_set)
+            subscribe.note = note
+            update_data["note"] = note
+
+        priority_valid = isinstance(priority, int) and not isinstance(priority, bool) and 1 <= priority <= 100
+        if priority is not None and not priority_valid:
+            summary["ignored_priority"] = priority
+        if priority_valid:
+            episode_priority = self.__get_episode_priority(subscribe)
+            for episode_number in sorted(priority_episodes):
+                episode_key = str(episode_number)
+                old_priority = episode_priority.get(episode_key)
+                if old_priority is None or priority > old_priority:
+                    episode_priority[episode_key] = priority
+                    priority_updated.append(episode_number)
+                else:
+                    priority_ignored.append({
+                        "episode": episode_number,
+                        "reason": "duplicate" if old_priority == priority else "not_higher_priority",
+                    })
+            if priority_updated:
+                subscribe.episode_priority = episode_priority
+                update_data["episode_priority"] = episode_priority
+
+        should_refresh_progress = subscribe.type == MediaType.TV.value and (accepted or priority_updated)
+        progress_summary = None
+        if should_refresh_progress and subscribe.best_version:
+            update_data.update(self.__prepare_subscribe_progress_fields(
+                subscribe=subscribe,
+                touch_last_update=True,
+            ))
+
         if update_data:
-            SubscribeOper().update(subscribe.id, update_data)
+            self.__apply_subscribe_update(subscribe, update_data)
+            summary["fields"] = list(update_data)
+        if should_refresh_progress and not subscribe.best_version:
+            progress_summary = self.refresh_subscribe_progress(subscribe, scene=scene)
+        if progress_summary is not None:
+            summary["progress"] = progress_summary
+        summary["updated"] = bool(update_data)
+        if progress_summary:
+            summary["updated"] = summary["updated"] or bool(progress_summary.get("updated"))
+        return summary
+
+    def __record_subscribe_download_facts(
+            self,
+            subscribe: Subscribe,
+            *,
+            mediainfo: MediaInfo,
+            downloads: Optional[List[Context]],
+    ) -> Dict[str, Any]:
+        """
+        记录主程序本轮下载产生的订阅事实，并返回本轮覆盖摘要。
+        """
+        if not downloads:
+            return {"episodes": [], "fields": [], "updated": False}
+
+        covered_episodes = set()
+        written_priorities: Dict[str, int] = {}
+        used_full_coverage_fallback = False
+        episode_priority = self.__get_episode_priority(subscribe)
+        note_set = {
+            int(episode)
+            for episode in subscribe.note or []
+            if str(episode).isdigit()
+        }
+        update_data: Dict[str, Any] = {}
+
+        for download in downloads:
+            media = download.media_info
+            if subscribe.tmdbid and media.tmdb_id and media.tmdb_id != subscribe.tmdbid:
+                continue
+            if subscribe.doubanid and media.douban_id and media.douban_id != subscribe.doubanid:
+                continue
+
+            if subscribe.type == MediaType.MOVIE.value and media.type == MediaType.MOVIE:
+                note_set.add(1)
+                covered_episodes.add(1)
+                continue
+
+            if subscribe.type != MediaType.TV.value or media.type != MediaType.TV:
+                continue
+
+            selected_episodes = getattr(download, "selected_episodes", None)
+            if selected_episodes:
+                episodes = selected_episodes
+            elif download.meta_info and download.meta_info.episode_list:
+                episodes = download.meta_info.episode_list
+            elif download.confirmed_full_coverage:
+                episodes = self.__get_best_version_target_episodes(subscribe)
+                used_full_coverage_fallback = True
+            else:
+                episodes = []
+
+            valid_episodes = []
+            for episode in episodes:
+                try:
+                    episode_number = int(episode)
+                except (TypeError, ValueError):
+                    continue
+                if episode_number not in self.__get_best_version_target_episodes(subscribe):
+                    continue
+                valid_episodes.append(episode_number)
+            if not valid_episodes:
+                continue
+
+            priority = download.torrent_info.pri_order
+            if (
+                    self.__is_full_best_version_enabled(subscribe)
+                    and download.confirmed_full_coverage
+                    and isinstance(priority, int)
+                    and not isinstance(priority, bool)
+                    and priority > (subscribe.current_priority or 0)
+            ):
+                subscribe.current_priority = priority
+                update_data["current_priority"] = priority
+            for episode_number in valid_episodes:
+                note_set.add(episode_number)
+                covered_episodes.add(episode_number)
+                episode_key = str(episode_number)
+                old_priority = episode_priority.get(episode_key)
+                if isinstance(priority, int) and not isinstance(priority, bool) \
+                        and (old_priority is None or priority > old_priority):
+                    episode_priority[episode_key] = priority
+                    written_priorities[episode_key] = priority
+
+        if covered_episodes:
+            update_data["note"] = sorted(note_set)
+            if subscribe.type == MediaType.TV.value:
+                update_data["episode_priority"] = episode_priority
+            update_data["last_update"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        if update_data:
+            self.__apply_subscribe_update(subscribe, update_data)
+            logger.info(
+                f"{mediainfo.title_year} 订阅 {subscribe.id} 第 {subscribe.season} 季记录下载事实："
+                f"mode=best_version:{subscribe.best_version},full:{subscribe.best_version_full}，"
+                f"covered_episodes={sorted(covered_episodes)}，episode_priority={written_priorities}，"
+                f"confirmed_full_coverage_fallback={used_full_coverage_fallback}"
+            )
+        return {
+            "episodes": sorted(covered_episodes),
+            "fields": list(update_data),
+            "updated": bool(update_data),
+        }
 
     def __finish_subscribe(self, subscribe: Subscribe, mediainfo: MediaInfo, meta: MetaBase):
         """
@@ -1333,6 +2816,15 @@ class SubscribeChain(ChainBase):
         # 如果订阅状态为待定（P），说明订阅信息尚未完全更新，无法完成订阅
         if subscribe.state == "P":
             return
+        # 发送订阅完成判定事件，在写入 DB 前，允许外部据完结策略否决本次自动完成
+        completion_event = eventmanager.send_event(
+            ChainEventType.SubscribeCompletionCheck,
+            SubscribeCompletionCheckEventData(subscribe=subscribe, mediainfo=mediainfo, meta=meta))
+        if completion_event and completion_event.event_data:
+            completion_data: SubscribeCompletionCheckEventData = completion_event.event_data
+            if completion_data.cancel:
+                logger.info(f'{mediainfo.title_year} 完成被 [{completion_data.source}] 否决：{completion_data.reason}')
+                return
         # 完成订阅
         msgstr = "订阅" if not subscribe.best_version else "洗版"
         logger.info(f'{mediainfo.title_year} 完成{msgstr}')
@@ -1367,38 +2859,685 @@ class SubscribeChain(ChainBase):
             "mediainfo": mediainfo.to_dict(),
         })
         # 统计订阅
-        SubscribeHelper().sub_done_async({
+        MoviePilotServerHelper.sub_done_async({
             "tmdbid": mediainfo.tmdb_id,
-            "doubanid": mediainfo.douban_id
+            "doubanid": mediainfo.douban_id,
+            "bangumiid": mediainfo.bangumi_id,
+            "anilistid": mediainfo.anilist_id,
+            "media_source": subscribe.media_source,
+            "media_id": subscribe.media_id,
+            "season": subscribe.season,
         })
 
-    def remote_list(self, channel: MessageChannel,
-                    userid: Union[str, int] = None, source: Optional[str] = None):
+    def remote_list(
+            self,
+            arg_str: str = "",
+            channel: MessageChannel = None,
+            userid: Union[str, int] = None,
+            source: Optional[str] = None,
+    ):
         """
-        查询订阅并发送消息
+        /subscribes 统一入口。
+        """
+        request = subscribe_interaction_manager.create_or_replace(
+            user_id=userid,
+            command="/subscribes",
+            channel=channel,
+            source=source,
+            username=None,
+        )
+        normalized_arg = (arg_str or "").strip()
+        if normalized_arg and self.handle_text_interaction(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username="",
+                text=normalized_arg,
+        ):
+            return
+        self._render_subscribe_interaction(
+            request=request,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username="",
+        )
+
+    @staticmethod
+    def parse_callback(callback_data: str) -> Optional[Tuple[str, str]]:
+        """
+        解析 /subscribes 按钮回调。
+        """
+        if not callback_data.startswith("subscribes:"):
+            return None
+        parts = callback_data.split(":")
+        if len(parts) < 3:
+            return None
+        return parts[1], parts[2]
+
+    def handle_callback_interaction(
+            self,
+            callback_data: str,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        处理 /subscribes 按钮交互。
+        """
+        parsed = self.parse_callback(callback_data)
+        if not parsed:
+            return False
+
+        request_id, action = parsed
+        request = subscribe_interaction_manager.get_by_id(request_id, userid)
+        if not request:
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="订阅交互已失效，请重新发送 /subscribes",
+                )
+            )
+            return True
+
+        request.channel = channel
+        request.source = source
+        request.username = username
+
+        if action == "close":
+            subscribe_interaction_manager.remove(request.request_id)
+            update_or_post_message(
+                chain=self,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="订阅管理",
+                text="订阅交互已结束",
+                original_message_id=original_message_id,
+                original_chat_id=original_chat_id,
+            )
+            return True
+
+        if action == "page-prev":
+            request.page = max(0, request.page - 1)
+            request.awaiting_input = None
+        elif action == "page-next":
+            request.page += 1
+            request.awaiting_input = None
+        elif action in {"search", "delete"}:
+            request.awaiting_input = action
+        elif action == "refresh":
+            request.awaiting_input = None
+            self._run_refresh_action(channel, source, userid, username)
+        elif action == "refresh-list":
+            request.awaiting_input = None
+        elif action == "metadata":
+            request.awaiting_input = None
+            self._run_metadata_refresh_action(channel, source, userid, username)
+
+        self._render_subscribe_interaction(
+            request=request,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        )
+        return True
+
+    def handle_text_interaction(
+            self,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            text: str,
+    ) -> bool:
+        """
+        处理 /subscribes 文本补充输入。
+        """
+        request = subscribe_interaction_manager.get_by_user(userid)
+        if not request:
+            return False
+
+        request.channel = channel
+        request.source = source
+        request.username = username
+
+        normalized = (text or "").strip()
+        lowered = normalized.lower()
+
+        if lowered in {"退出", "关闭", "q", "quit", "exit"}:
+            subscribe_interaction_manager.remove(request.request_id)
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="订阅交互已结束",
+                    save_history=False,
+                )
+            )
+            return True
+
+        if lowered in {"取消", "cancel", "返回", "back"}:
+            request.awaiting_input = None
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"刷新列表", "列表", "list"}:
+            request.awaiting_input = None
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"刷新", "refresh"}:
+            request.awaiting_input = None
+            self._run_refresh_action(channel, source, userid, username)
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"元数据", "刷新元数据", "metadata"}:
+            request.awaiting_input = None
+            self._run_metadata_refresh_action(channel, source, userid, username)
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"p", "prev", "上一页"}:
+            request.awaiting_input = None
+            request.page = max(0, request.page - 1)
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if lowered in {"n", "next", "下一页"}:
+            request.awaiting_input = None
+            request.page += 1
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        search_match = re.match(r"^(?:搜索|search)\s+(.+)$", normalized, re.IGNORECASE)
+        delete_match = re.match(r"^(?:删除|delete)\s+(.+)$", normalized, re.IGNORECASE)
+
+        if request.awaiting_input == "search":
+            success, message = self._run_search_action(
+                normalized, channel, source, userid, username
+            )
+            request.awaiting_input = None
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if request.awaiting_input == "delete":
+            success, message = self._delete_subscribes(normalized)
+            request.awaiting_input = None
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if search_match:
+            success, message = self._run_search_action(
+                search_match.group(1), channel, source, userid, username
+            )
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        if delete_match:
+            success, message = self._delete_subscribes(delete_match.group(1))
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=message,
+                )
+            )
+            self._render_subscribe_interaction(
+                request=request,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+            )
+            return True
+
+        self.post_message(
+            schemas.Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title=self._subscribe_usage_hint(request.awaiting_input),
+            )
+        )
+        return True
+
+    def _render_subscribe_interaction(
+            self,
+            request,
+            channel: MessageChannel,
+            source: Optional[str],
+            userid: Union[str, int],
+            username: Optional[str],
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+    ) -> None:
+        """
+        渲染 /subscribes 当前页面。
         """
         subscribes = SubscribeOper().list()
-        if not subscribes:
-            self.post_message(schemas.Notification(channel=channel,
-                                                   source=source,
-                                                   title='没有任何订阅！', userid=userid))
-            return
-        title = f"共有 {len(subscribes)} 个订阅，回复对应指令操作： " \
-                f"\n- 删除订阅：/subscribe_delete [id]" \
-                f"\n- 搜索订阅：/subscribe_search [id]" \
-                f"\n- 刷新订阅：/subscribe_refresh"
-        messages = []
+        page_size = (
+            self._button_page_size
+            if supports_interaction_buttons(channel)
+            else self._text_page_size
+        )
+        page_subscribes, page, total_pages = page_items(
+            subscribes, request.page, page_size
+        )
+        request.page = page
+
+        if subscribes:
+            body = self._format_subscribe_list(page_subscribes, channel=channel)
+            footer = [
+                f"第 {page + 1}/{total_pages} 页，共 {len(subscribes)} 个订阅",
+                self._subscribe_prompt(request.awaiting_input),
+                self._subscribe_usage_hint(request.awaiting_input),
+            ]
+            text = "\n\n".join([body, *[line for line in footer if line]])
+        else:
+            text = "当前没有任何订阅。\n\n输入 `退出` 结束交互。"
+
+        buttons = None
+        if supports_interaction_buttons(channel):
+            buttons = build_navigation_buttons(
+                "subscribes", request, page, total_pages
+            )
+            buttons.extend(
+                [
+                    [
+                        {
+                            "text": "搜索订阅",
+                            "callback_data": f"subscribes:{request.request_id}:search",
+                        },
+                        {
+                            "text": "删除订阅",
+                            "callback_data": f"subscribes:{request.request_id}:delete",
+                        },
+                        {
+                            "text": "刷新订阅",
+                            "callback_data": f"subscribes:{request.request_id}:refresh",
+                        },
+                    ],
+                    [
+                        {
+                            "text": "刷新元数据",
+                            "callback_data": f"subscribes:{request.request_id}:metadata",
+                        },
+                        {
+                            "text": "刷新列表",
+                            "callback_data": f"subscribes:{request.request_id}:refresh-list",
+                        },
+                        {
+                            "text": "关闭",
+                            "callback_data": f"subscribes:{request.request_id}:close",
+                        },
+                    ],
+                ]
+            )
+
+        update_or_post_message(
+            chain=self,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=username,
+            title="订阅管理",
+            text=text,
+            buttons=buttons,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+        )
+
+    def _format_subscribe_list(
+            self, subscribes: List[Subscribe], channel: Optional[MessageChannel]
+    ) -> str:
+        """
+        根据渠道能力格式化订阅列表。
+        """
+        if supports_markdown(channel):
+            rows = [
+                [
+                    subscribe.id,
+                    subscribe.name,
+                    subscribe.type,
+                    subscribe.year or "-",
+                    self._format_subscribe_progress(subscribe),
+                    self._format_subscribe_state(subscribe.state),
+                ]
+                for subscribe in subscribes
+            ]
+            return format_markdown_table(
+                headers=["ID", "名称", "类型", "年份", "季/进度", "状态"],
+                rows=rows,
+            )
+
+        lines = []
         for subscribe in subscribes:
-            if subscribe.type == MediaType.MOVIE.value:
-                messages.append(f"{subscribe.id}. {subscribe.name}（{subscribe.year}）")
-            else:
-                messages.append(f"{subscribe.id}. {subscribe.name}（{subscribe.year}）"
-                                f"第{subscribe.season}季 "
-                                f"[{subscribe.total_episode - (subscribe.lack_episode or subscribe.total_episode)}"
-                                f"/{subscribe.total_episode}]")
-        # 发送列表
-        self.post_message(schemas.Notification(channel=channel, source=source,
-                                               title=title, text='\n'.join(messages), userid=userid))
+            lines.append(
+                f"{subscribe.id}. {subscribe.name}（{subscribe.year or '-'}）"
+                f" | {subscribe.type}"
+                f" | {self._format_subscribe_progress(subscribe)}"
+                f" | 状态：{self._format_subscribe_state(subscribe.state)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_subscribe_state(state: Optional[str]) -> str:
+        """
+        订阅状态显示文本。
+        """
+        mapping = {
+            "N": "新建",
+            "R": "订阅中",
+            "P": "待定",
+            "S": "暂停",
+        }
+        return mapping.get(state or "", state or "-")
+
+    @staticmethod
+    def _format_subscribe_progress(subscribe: Subscribe) -> str:
+        """
+        构造订阅的季和进度说明。
+        """
+        if subscribe.type == MediaType.MOVIE.value:
+            return "电影"
+        season = subscribe.season if subscribe.season is not None else 1
+        if subscribe.total_episode:
+            lack_episode = (
+                subscribe.lack_episode
+                if subscribe.lack_episode is not None
+                else subscribe.total_episode
+            )
+            downloaded = max(subscribe.total_episode - lack_episode, 0)
+            return f"第{season}季 [{downloaded}/{subscribe.total_episode}]"
+        return f"第{season}季"
+
+    @staticmethod
+    def _subscribe_prompt(awaiting_input: Optional[str]) -> str:
+        """
+        返回当前输入模式提示。
+        """
+        if awaiting_input == "search":
+            return "当前操作：搜索订阅，请输入订阅 ID，多个 ID 用空格分隔，或输入 all 搜索全部。"
+        if awaiting_input == "delete":
+            return "当前操作：删除订阅，请输入订阅 ID，多个 ID 用空格分隔。"
+        return ""
+
+    @staticmethod
+    def _subscribe_usage_hint(awaiting_input: Optional[str]) -> str:
+        """
+        返回 /subscribes 的文本操作提示。
+        """
+        if awaiting_input == "search":
+            return "输入订阅 ID 或 all；输入 `取消` 返回列表，输入 `退出` 结束交互。"
+        if awaiting_input == "delete":
+            return "输入一个或多个订阅 ID；输入 `取消` 返回列表，输入 `退出` 结束交互。"
+        return (
+            "可输入：`搜索 <id...|all>`、`删除 <id...>`、`刷新`、`刷新元数据`、`n`、`p`、`退出`。"
+        )
+
+    def _run_refresh_action(
+            self,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+    ) -> None:
+        """
+        执行订阅刷新。
+        """
+        self.post_message(
+            schemas.Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="开始刷新订阅...",
+            )
+        )
+        self.refresh()
+        self.post_message(
+            schemas.Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="订阅刷新执行完成",
+            )
+        )
+
+    def _run_metadata_refresh_action(
+            self,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+    ) -> None:
+        """
+        执行订阅元数据刷新。
+        """
+        self.post_message(
+            schemas.Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="开始刷新订阅元数据...",
+            )
+        )
+        self.check()
+        self.post_message(
+            schemas.Notification(
+                channel=channel,
+                source=source,
+                userid=userid,
+                username=username,
+                title="订阅元数据刷新完成",
+            )
+        )
+
+    @staticmethod
+    def _parse_subscribe_ids(arg_str: str) -> List[int]:
+        """
+        从输入中提取订阅 ID。
+        """
+        return [int(item) for item in re.findall(r"\d+", arg_str or "")]
+
+    def _run_search_action(
+            self,
+            arg_str: str,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+    ) -> Tuple[bool, str]:
+        """
+        手动执行订阅搜索。
+        """
+        normalized = (arg_str or "").strip()
+        if not normalized or normalized.lower() in {"all", "全部", "所有"}:
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="开始搜索所有订阅...",
+                )
+            )
+            self.search(state="N,R,P", manual=True)
+            return True, "所有订阅搜索完成"
+
+        subscribe_ids = self._parse_subscribe_ids(normalized)
+        if not subscribe_ids:
+            return False, "请输入订阅 ID，多个 ID 用空格分隔，或输入 all"
+
+        subscribeoper = SubscribeOper()
+        missing = []
+        searched = []
+        for subscribe_id in subscribe_ids:
+            subscribe = subscribeoper.get(subscribe_id)
+            if not subscribe:
+                missing.append(str(subscribe_id))
+                continue
+            self.post_message(
+                schemas.Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title=f"开始搜索订阅【{subscribe.name}】...",
+                )
+            )
+            self.search(sid=subscribe_id, manual=True)
+            searched.append(subscribe.name)
+
+        if not searched and missing:
+            return False, f"未找到订阅：{', '.join(missing)}"
+
+        message = f"已完成 {len(searched)} 个订阅搜索"
+        if searched:
+            message += f"：{', '.join(searched)}"
+        if missing:
+            message += f"；未找到：{', '.join(missing)}"
+        return True, message
+
+    def _delete_subscribes(self, arg_str: str) -> Tuple[bool, str]:
+        """
+        批量删除订阅。
+        """
+        subscribe_ids = self._parse_subscribe_ids(arg_str)
+        if not subscribe_ids:
+            return False, "请输入至少一个有效的订阅 ID"
+
+        subscribeoper = SubscribeOper()
+        deleted = []
+        missing = []
+        for subscribe_id in subscribe_ids:
+            subscribe = subscribeoper.get(subscribe_id)
+            if not subscribe:
+                missing.append(str(subscribe_id))
+                continue
+            deleted.append(subscribe.name)
+            subscribeoper.delete(subscribe_id)
+            MoviePilotServerHelper.sub_done_async(
+                {
+                    "tmdbid": subscribe.tmdbid,
+                    "doubanid": subscribe.doubanid,
+                    "bangumiid": subscribe.bangumiid,
+                    "anilistid": subscribe.anilistid,
+                    "media_source": subscribe.media_source,
+                    "media_id": subscribe.media_id,
+                    "season": subscribe.season,
+                }
+            )
+
+        if not deleted and missing:
+            return False, f"未找到订阅：{', '.join(missing)}"
+
+        message = f"已删除 {len(deleted)} 个订阅"
+        if deleted:
+            message += f"：{', '.join(deleted)}"
+        if missing:
+            message += f"；未找到：{', '.join(missing)}"
+        return True, message
 
     def remote_delete(self, arg_str: str, channel: MessageChannel,
                       userid: Union[str, int] = None, source: Optional[str] = None):
@@ -1406,13 +3545,16 @@ class SubscribeChain(ChainBase):
         删除订阅
         """
         if not arg_str:
-            self.post_message(schemas.Notification(channel=channel, source=source,
-                                                   title="请输入正确的命令格式：/subscribe_delete [id]，"
-                                                         "[id]为订阅编号", userid=userid))
+            self.post_message(schemas.Notification(
+                channel=channel,
+                source=source,
+                title="请输入正确的命令格式：/subscribe_delete [id]，"
+                      "[id]为订阅编号",
+                userid=userid,
+                save_history=False))
             return
         arg_strs = str(arg_str).split()
         subscribeoper = SubscribeOper()
-        subscribehelper = SubscribeHelper()
         for arg_str in arg_strs:
             arg_str = arg_str.strip()
             if not arg_str.isdigit():
@@ -1420,15 +3562,23 @@ class SubscribeChain(ChainBase):
             subscribe_id = int(arg_str)
             subscribe = subscribeoper.get(subscribe_id)
             if not subscribe:
-                self.post_message(schemas.Notification(channel=channel, source=source,
-                                                       title=f"订阅编号 {subscribe_id} 不存在！", userid=userid))
+                self.post_message(schemas.Notification(
+                    channel=channel, source=source,
+                    title=f"订阅编号 {subscribe_id} 不存在！",
+                    userid=userid,
+                    save_history=False))
                 return
             # 删除订阅
             subscribeoper.delete(subscribe_id)
             # 统计订阅
-            subscribehelper.sub_done_async({
+            MoviePilotServerHelper.sub_done_async({
                 "tmdbid": subscribe.tmdbid,
-                "doubanid": subscribe.doubanid
+                "doubanid": subscribe.doubanid,
+                "bangumiid": subscribe.bangumiid,
+                "anilistid": subscribe.anilistid,
+                "media_source": subscribe.media_source,
+                "media_id": subscribe.media_id,
+                "season": subscribe.season,
             })
         # 重新发送消息
         self.remote_list(channel=channel, userid=userid, source=source)
@@ -1471,9 +3621,16 @@ class SubscribeChain(ChainBase):
                 # 更新剧集列表、开始集数、总集数
                 if not episode_list:
                     # 整季缺失
-                    episodes = []
                     start_episode = start_episode or start
                     total_episode = total_episode or total
+                    original_start = start if start is not None else 1
+                    # 空集列表会被下载链解释为整季下载；当订阅开始集裁掉季初范围时，需要转成显式集数。
+                    if start_episode and total_episode and start_episode > original_start:
+                        episodes = list(range(start_episode, total_episode + 1))
+                        if not episodes:
+                            return True, {}
+                    else:
+                        episodes = []
                 else:
                     # 部分缺失
                     if not start_episode \
@@ -1498,7 +3655,8 @@ class SubscribeChain(ChainBase):
                     season=begin_season,
                     episodes=episodes,
                     total_episode=total_episode,
-                    start_episode=start_episode
+                    start_episode=start_episode,
+                    require_complete_coverage=no_exist_season.require_complete_coverage
                 )
         # 根据订阅已下载集数更新缺失集数
         if downloaded_episodes:
@@ -1526,6 +3684,7 @@ class SubscribeChain(ChainBase):
                     episodes=episodes,
                     total_episode=total,
                     start_episode=start,
+                    require_complete_coverage=no_exist_season.require_complete_coverage
                 )
             else:
                 # 开始集数
@@ -1540,6 +3699,7 @@ class SubscribeChain(ChainBase):
                     episodes=episodes,
                     total_episode=total_episode,
                     start_episode=start,
+                    require_complete_coverage=False,
                 )
         logger.info(f'订阅 {subscribe_name} 缺失剧集数更新为：{no_exists}')
         return False, no_exists
@@ -1664,7 +3824,14 @@ class SubscribeChain(ChainBase):
 
         # 所有下载记录
         downloadhis = DownloadHistoryOper()
-        download_his = downloadhis.get_by_mediaid(tmdbid=subscribe.tmdbid, doubanid=subscribe.doubanid)
+        download_his = downloadhis.get_by_mediaid(
+            tmdbid=subscribe.tmdbid,
+            doubanid=subscribe.doubanid,
+            bangumiid=subscribe.bangumiid,
+            anilistid=subscribe.anilistid,
+            media_source=subscribe.media_source,
+            media_id=subscribe.media_id,
+        )
         if download_his:
             for his in download_his:
                 # 查询下载文件
@@ -1683,7 +3850,7 @@ class SubscribeChain(ChainBase):
                         )
                         if subscribe.type == MediaType.TV.value:
                             season_number = file_meta.begin_season
-                            if season_number and season_number != subscribe.season:
+                            if season_number is not None and season_number != subscribe.season:
                                 continue
                             episode_number = file_meta.begin_episode
                             if episode_number and episodes.get(episode_number):
@@ -1691,21 +3858,19 @@ class SubscribeChain(ChainBase):
                         else:
                             episodes[0].download.append(file_info)
 
-        # 生成元数据
-        meta = MetaInfo(subscribe.name)
-        meta.year = subscribe.year
-        meta.begin_season = subscribe.season or None
         try:
-            meta.type = MediaType(subscribe.type)
+            meta = build_subscribe_meta(subscribe)
         except ValueError:
             logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
             return subscribe_info
         # 识别媒体信息
-        mediainfo: MediaInfo = self.recognize_media(meta=meta, mtype=meta.type,
-                                                    tmdbid=subscribe.tmdbid,
-                                                    doubanid=subscribe.doubanid,
-                                                    episode_group=subscribe.episode_group,
-                                                    cache=False)
+        mediainfo: MediaInfo = self.recognize_media(
+            meta=meta,
+            mtype=meta.type,
+            **_subscribe_recognize_kwargs(subscribe),
+            episode_group=subscribe.episode_group,
+            cache=False,
+        )
         if not mediainfo:
             logger.warn(
                 f'未识别到媒体信息，标题：{subscribe.name}，tmdbid：{subscribe.tmdbid}，doubanid：{subscribe.doubanid}')
@@ -1724,13 +3889,91 @@ class SubscribeChain(ChainBase):
                 )
                 if subscribe.type == MediaType.TV.value:
                     season_number = file_meta.begin_season
-                    if season_number and season_number != subscribe.season:
+                    if season_number is not None and season_number != subscribe.season:
                         continue
                     episode_number = file_meta.begin_episode
                     if episode_number and episodes.get(episode_number):
                         episodes[episode_number].library.append(file_info)
                 else:
                     episodes[0].library.append(file_info)
+
+        # 合并所有媒体服务器已存在条目（逐台查询，不只取第一个命中）
+        mediaserver_chain = MediaServerChain()
+        server_names = list(MediaServerHelper().get_services().keys())
+
+        def _has_server_entry(library_list: List[schemas.SubscribeLibraryFileInfo],
+                              server_name: Optional[str],
+                              server_type: Optional[str]) -> bool:
+            for info in library_list or []:
+                if info.server and server_name and info.server == server_name:
+                    return True
+                if info.server_type and server_type and info.server_type == server_type \
+                        and info.server == server_name \
+                        and (not info.file_path or str(info.file_path).startswith(("http://", "https://"))):
+                    return True
+            return False
+
+        for server_name in server_names:
+            exists_media = self.media_exists(mediainfo=mediainfo, server=server_name)
+            # 仅合并真实媒体服务器结果，跳过本地 FileManager 兜底（已由 media_files 覆盖）
+            if not exists_media or not (exists_media.server or exists_media.server_type):
+                continue
+
+            resolved_server = exists_media.server or server_name
+            server_storage = exists_media.server_type or resolved_server
+            server_itemid = str(exists_media.itemid) if exists_media.itemid is not None else None
+            series_detail_url = None
+            if resolved_server and exists_media.itemid is not None:
+                series_detail_url = mediaserver_chain.get_play_url(
+                    server=resolved_server,
+                    item_id=exists_media.itemid,
+                )
+
+            if subscribe.type == MediaType.TV.value:
+                season_number = subscribe.season if subscribe.season is not None else 1
+                exist_episodes = (exists_media.seasons or {}).get(season_number) or []
+                episode_item_ids: Dict[int, str] = {}
+                if resolved_server and exists_media.itemid is not None:
+                    episode_item_ids = mediaserver_chain.get_season_episode_ids(
+                        server=resolved_server,
+                        item_id=exists_media.itemid,
+                        season=season_number,
+                    )
+                for episode_number in exist_episodes:
+                    episode_info = episodes.get(episode_number)
+                    if not episode_info:
+                        continue
+                    if _has_server_entry(episode_info.library, resolved_server, exists_media.server_type):
+                        continue
+                    episode_itemid = episode_item_ids.get(episode_number) or server_itemid
+                    detail_url = series_detail_url
+                    if resolved_server and episode_item_ids.get(episode_number):
+                        detail_url = mediaserver_chain.get_play_url(
+                            server=resolved_server,
+                            item_id=episode_itemid,
+                        ) or series_detail_url
+                    episode_info.library.append(
+                        schemas.SubscribeLibraryFileInfo(
+                            storage=server_storage,
+                            file_path=detail_url,
+                            server=resolved_server,
+                            server_type=exists_media.server_type,
+                            itemid=str(episode_itemid) if episode_itemid is not None else None,
+                        )
+                    )
+            else:
+                episode_info = episodes.get(0)
+                if episode_info and not _has_server_entry(
+                        episode_info.library, resolved_server, exists_media.server_type):
+                    episode_info.library.append(
+                        schemas.SubscribeLibraryFileInfo(
+                            storage=server_storage,
+                            file_path=series_detail_url,
+                            server=resolved_server,
+                            server_type=exists_media.server_type,
+                            itemid=server_itemid,
+                        )
+                    )
 
         # 更新订阅信息
         subscribe_info.subscribe = Subscribe(**subscribe.to_dict())
@@ -1753,64 +3996,19 @@ class SubscribeChain(ChainBase):
             - exist_flag (bool): 布尔值，表示媒体是否已经完全下载或已存在
             - no_exists (dict): 缺失的媒体信息，包含缺失的集数或其他相关信息
         """
-        # 非洗版
-        if not subscribe.best_version:
-            # 每季总集数
-            totals = {}
-            if subscribe.season and subscribe.total_episode:
-                totals = {
-                    subscribe.season: subscribe.total_episode
-                }
-            # 查询媒体库缺失的媒体信息
-            exist_flag, no_exists = DownloadChain().get_no_exists_info(
-                meta=meta,
-                mediainfo=mediainfo,
-                totals=totals
-            )
-        else:
-            # 洗版，如果已经满足了优先级，则认为已经洗版完成
-            if subscribe.current_priority == 100:
-                exist_flag = True
-                no_exists = {}
-            else:
-                exist_flag = False
-                if meta.type == MediaType.TV:
-                    # 对于电视剧，构造缺失的媒体信息
-                    no_exists = {
-                        mediakey: {
-                            subscribe.season: schemas.NotExistMediaInfo(
-                                season=subscribe.season,
-                                episodes=[],
-                                total_episode=subscribe.total_episode,
-                                start_episode=subscribe.start_episode or 1)
-                        }
-                    }
-                else:
-                    no_exists = {}
+        self.__refresh_total_episode_before_completion(
+            subscribe=subscribe,
+            mediainfo=mediainfo,
+            meta=meta,
+            mediakey=mediakey,
+        )
 
-        # 如果媒体已存在，执行订阅完成操作
-        if exist_flag:
-            if not subscribe.best_version:
-                logger.info(f'{mediainfo.title_year} 媒体库中已存在')
-            self.finish_subscribe_or_not(subscribe=subscribe, meta=meta, mediainfo=mediainfo, force=True)
-            return True, no_exists
-
-        # 获取已下载的集数或电影
-        downloaded = self.__get_downloaded(subscribe)
-        if meta.type == MediaType.TV:
-            # 对于电视剧类型，整合缺失集数并剔除已下载的集数
-            exist_flag, no_exists = self.__get_subscribe_no_exits(
-                subscribe_name=f'{subscribe.name} {meta.season}',
-                no_exists=no_exists,
-                mediakey=mediakey,
-                begin_season=meta.begin_season,
-                total_episode=subscribe.total_episode,
-                start_episode=subscribe.start_episode,
-                downloaded_episodes=downloaded
-            )
-        elif meta.type == MediaType.MOVIE:
-            # 对于电影类型，直接根据是否已下载判断
-            exist_flag = bool(downloaded)
+        exist_flag, no_exists = self.resolve_subscribe_missing(
+            subscribe=subscribe,
+            meta=meta,
+            mediainfo=mediainfo,
+            mediakey=mediakey,
+        )
 
         # 如果已下载完毕，执行订阅完成操作
         if exist_flag:
@@ -1820,6 +4018,328 @@ class SubscribeChain(ChainBase):
 
         # 返回结果，表示媒体未完全下载或存在
         return False, no_exists
+
+    def resolve_subscribe_missing(self, subscribe: Subscribe, meta: MetaBase,
+                                  mediainfo: MediaInfo,
+                                  mediakey: Optional[Union[str, int]] = None,
+                                  best_version_accept_downloaded: bool = False):
+        """
+        按主程序订阅口径查询当前目标是否仍有缺失，不推进订阅状态。
+
+        该方法只组合媒体库缺集、订阅范围、下载历史和洗版优先级，用于外部策略在
+        完成前复用主程序"还要不要搜索/下载"的判断口径。它不得完成订阅、写入
+        lack_episode、发送事件或修改数据库。
+
+        best_version_accept_downloaded 仅用于分集洗版的外部完成守卫：为 True 时，
+        priority>0 的目标集视为已满足；默认 False 保持主程序洗版完成需 priority==100
+        的搜索/完成口径。
+        """
+        mediakey = mediakey or _subscribe_media_key(subscribe)
+        effective_total_episode = self.__resolve_effective_total_episode(subscribe, mediainfo)
+
+        if not subscribe.best_version:
+            totals = {}
+            if subscribe.season is not None and effective_total_episode:
+                totals = {
+                    subscribe.season: effective_total_episode
+                }
+            exist_flag, no_exists = DownloadChain().get_no_exists_info(
+                meta=meta,
+                mediainfo=mediainfo,
+                totals=totals
+            )
+        elif meta.type != MediaType.TV and self.__is_best_version_complete(subscribe):
+            return True, {}
+        else:
+            exist_flag = False
+            if meta.type == MediaType.TV:
+                if self.__is_full_best_version_enabled(subscribe):
+                    pending_episodes = []
+                elif best_version_accept_downloaded:
+                    downloaded = set(self.__get_downloaded_best_version_episodes(
+                        subscribe, total_episode=effective_total_episode
+                    ))
+                    start_episode = subscribe.start_episode or 1
+                    pending_episodes = [
+                        episode for episode in range(start_episode, effective_total_episode + 1)
+                        if episode not in downloaded
+                    ]
+                    if not pending_episodes:
+                        return True, {}
+                else:
+                    pending_episodes = self._get_pending_best_version_episodes(
+                        subscribe, total_episode=effective_total_episode
+                    )
+                    if not pending_episodes:
+                        return True, {}
+                no_exists = {
+                    mediakey: {
+                        subscribe.season: schemas.NotExistMediaInfo(
+                            season=subscribe.season,
+                            episodes=pending_episodes,
+                            total_episode=effective_total_episode,
+                            start_episode=subscribe.start_episode or 1,
+                            require_complete_coverage=self.__is_full_best_version_enabled(subscribe))
+                    }
+                }
+            else:
+                no_exists = {}
+
+        if exist_flag:
+            return True, no_exists
+
+        downloaded = self.__get_downloaded(subscribe)
+        if self.__is_full_best_version_enabled(subscribe):
+            downloaded = []
+        if meta.type == MediaType.TV:
+            return self.__get_subscribe_no_exits(
+                subscribe_name=f'{subscribe.name} {meta.season}',
+                no_exists=no_exists,
+                mediakey=mediakey,
+                begin_season=meta.begin_season,
+                total_episode=effective_total_episode,
+                start_episode=subscribe.start_episode,
+                downloaded_episodes=downloaded
+            )
+        if meta.type == MediaType.MOVIE:
+            return bool(downloaded), no_exists
+        return False, no_exists
+
+    def __resolve_total_episode_decrease(
+            self,
+            subscribe: Subscribe,
+            candidate_total: int,
+            meta: MetaBase,
+            mediainfo: MediaInfo,
+            mediakey: Optional[Union[str, int]] = None,
+    ) -> int:
+        """以旧目标范围内已确认存在的最高集号限制总集数回落。"""
+        old_total = subscribe.total_episode or 0
+        if candidate_total >= old_total or not old_total:
+            return candidate_total
+        if subscribe.type != MediaType.TV.value or self.__is_full_best_version_enabled(subscribe):
+            return candidate_total
+
+        target_key = mediakey or _subscribe_media_key(subscribe)
+        target_season = subscribe.season
+        target_start = subscribe.start_episode or 1
+        snapshot = copy.copy(subscribe)
+        snapshot.total_episode = old_total
+        try:
+            satisfied, no_exists = self.resolve_subscribe_missing(
+                subscribe=snapshot,
+                meta=meta,
+                mediainfo=mediainfo,
+                mediakey=target_key,
+                best_version_accept_downloaded=bool(subscribe.best_version),
+            )
+        except Exception as err:
+            logger.warning(f"订阅 {subscribe.name} 已存在分集事实查询失败，按元数据总集数继续：{err}")
+            return candidate_total
+
+        if satisfied:
+            return old_total
+        if not isinstance(no_exists, dict):
+            return candidate_total
+        seasons = next(
+            (
+                no_exists.get(media_key)
+                for media_key in [target_key, *_subscribe_media_keys(subscribe)]
+                if no_exists.get(media_key) is not None
+            ),
+            None,
+        )
+        if not isinstance(seasons, dict):
+            return candidate_total
+        missing_info = seasons.get(target_season)
+        if not missing_info:
+            return candidate_total
+        try:
+            scope_matches = missing_info.season == target_season \
+                and missing_info.start_episode == target_start \
+                and missing_info.total_episode == old_total
+            episodes = missing_info.episodes
+        except AttributeError:
+            return candidate_total
+        if not scope_matches:
+            return candidate_total
+        if not isinstance(episodes, list) or not episodes:
+            return candidate_total
+        if any(isinstance(episode, bool) or not isinstance(episode, int)
+               or episode < target_start or episode > old_total for episode in episodes):
+            return candidate_total
+
+        confirmed = set(range(target_start, old_total + 1)).difference(episodes)
+        return max(candidate_total, max(confirmed) if confirmed else 0)
+
+    @staticmethod
+    def __resolve_effective_total_episode(subscribe: Subscribe, mediainfo: MediaInfo) -> int:
+        """
+        只读计算完成前有效总集数，不触发事件、不写回订阅。
+
+        主流程会通过 ``__refresh_total_episode_before_completion`` 持久化增长后的总集数；
+        该查询接口只需要同样避免旧 total 造成误判，因此仅使用当前 mediainfo 中更大的
+        季集数作为临时目标范围。
+        """
+        current_total = subscribe.total_episode or 0
+        if subscribe.type != MediaType.TV.value:
+            return current_total
+        if subscribe.manual_total_episode:
+            return current_total
+        if subscribe.season is None:
+            return current_total
+        media_total = len((mediainfo.seasons or {}).get(subscribe.season) or [])
+        if media_total > current_total:
+            return media_total
+        return current_total
+
+    @staticmethod
+    def __apply_episodes_refresh(current_total: int, season: Optional[int], *,
+                                 mediainfo: Optional[MediaInfo] = None,
+                                 tmdbid: Optional[int] = None,
+                                 doubanid: Optional[str] = None,
+                                 bangumiid: Optional[int] = None,
+                                 anilistid: Optional[int] = None,
+                                 media_source: Optional[str] = None,
+                                 media_id: Optional[str] = None,
+                                 subscribe_id: Optional[int] = None,
+                                 scene: Optional[str] = None) -> int:
+        """
+        发送订阅总集数推算事件，允许外部把当前数据源识别到的季总集数向上覆盖。
+
+        用途：插件在"待定集数"等场景经事件注入 total_episode
+        无监听者或外部未覆盖时返回入参原值，保证零行为变更。
+        :param current_total: 主程序本次识别到的当前季总集数
+        :param season: 季号
+        :return: 最终采用的总集数
+        """
+        event_data = SubscribeEpisodesRefreshEventData(
+            tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid,
+            anilistid=anilistid, media_source=media_source, media_id=media_id,
+            season=season, mediainfo=mediainfo,
+            current_total_episode=current_total, subscribe_id=subscribe_id, scene=scene)
+        event = eventmanager.send_event(ChainEventType.SubscribeEpisodesRefresh, event_data)
+        if event and event.event_data:
+            result: SubscribeEpisodesRefreshEventData = event.event_data
+            if result.updated and result.total_episode:
+                result.total_episode = max(current_total or 0, result.total_episode)
+                return result.total_episode
+        return current_total
+
+    @staticmethod
+    async def __async_apply_episodes_refresh(current_total: int, season: Optional[int], *,
+                                             mediainfo: Optional[MediaInfo] = None,
+                                             tmdbid: Optional[int] = None,
+                                             doubanid: Optional[str] = None,
+                                             bangumiid: Optional[int] = None,
+                                             anilistid: Optional[int] = None,
+                                             media_source: Optional[str] = None,
+                                             media_id: Optional[str] = None,
+                                             subscribe_id: Optional[int] = None,
+                                             scene: Optional[str] = None) -> int:
+        """
+        __apply_episodes_refresh 的异步版本
+        """
+        event_data = SubscribeEpisodesRefreshEventData(
+            tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid,
+            anilistid=anilistid, media_source=media_source, media_id=media_id,
+            season=season, mediainfo=mediainfo,
+            current_total_episode=current_total, subscribe_id=subscribe_id, scene=scene)
+        event = await eventmanager.async_send_event(ChainEventType.SubscribeEpisodesRefresh, event_data)
+        if event and event.event_data:
+            result: SubscribeEpisodesRefreshEventData = event.event_data
+            if result.updated and result.total_episode:
+                result.total_episode = max(current_total or 0, result.total_episode)
+                return result.total_episode
+        return current_total
+
+    def __refresh_total_episode_before_completion(
+            self,
+            subscribe: Subscribe,
+            mediainfo: MediaInfo,
+            meta: Optional[MetaBase] = None,
+            mediakey: Optional[Union[str, int]] = None,
+    ) -> None:
+        """
+        在完成判断前，按最新识别结果兜底修正订阅总集数，防止旧总集数导致误完成。
+        """
+        if subscribe.type != MediaType.TV.value:
+            return
+        if subscribe.manual_total_episode:
+            return
+        if subscribe.season is None:
+            return
+
+        current_total_episode = len((mediainfo.seasons or {}).get(subscribe.season) or [])
+        # 外部事件只能向上覆盖主程序本次识别到的 TMDB 当前季总集数，已有订阅回落由主程序跟随本次识别结果持久化。
+        new_total_episode = self.__apply_episodes_refresh(
+            current_total_episode, season=subscribe.season, mediainfo=mediainfo,
+            tmdbid=subscribe.tmdbid, doubanid=subscribe.doubanid,
+            bangumiid=subscribe.bangumiid,
+            anilistid=subscribe.anilistid,
+            media_source=subscribe.media_source,
+            media_id=subscribe.media_id,
+            subscribe_id=subscribe.id, scene="precheck")
+        old_total_episode = subscribe.total_episode or 0
+        if meta is not None and new_total_episode and new_total_episode < old_total_episode:
+            new_total_episode = self.__resolve_total_episode_decrease(
+                subscribe=subscribe,
+                candidate_total=new_total_episode,
+                meta=meta,
+                mediainfo=mediainfo,
+                mediakey=mediakey,
+            )
+        if not new_total_episode or new_total_episode == old_total_episode:
+            return
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_data = self.__prepare_total_episode_change_fields(
+            subscribe=subscribe,
+            total_episode=new_total_episode,
+            old_total_episode=old_total_episode,
+        )
+        update_data["last_update"] = now
+        SubscribeOper().update(subscribe.id, update_data)
+        for key, value in update_data.items():
+            setattr(subscribe, key, value)
+        subscribe.last_update = now
+        logger.info(
+            f"订阅 {subscribe.name} 第{subscribe.season}季 总集数更新为 {new_total_episode}，"
+            f"缺失集数更新为 {subscribe.lack_episode}"
+        )
+
+    @classmethod
+    def _is_episode_range_covered(cls, meta: MetaBase, subscribe: Subscribe) -> bool:
+        """
+        判断种子是否覆盖当前仍需洗版的剧集范围。
+        """
+        episodes = meta.episode_list
+        if not episodes:
+            # 没有剧集信息，表示该种子为合集
+            return True
+
+        pending_episodes = cls._get_pending_best_version_episodes(subscribe)
+        if not pending_episodes:
+            return True
+
+        return bool(set(episodes).intersection(set(pending_episodes)))
+
+    @staticmethod
+    def __get_media_id_match_source(mediainfo: Optional[MediaInfo]) -> str:
+        """
+        返回候选自身识别命中的明确媒体 ID 类型。
+        """
+        if mediainfo and mediainfo.tmdb_id:
+            return "tmdbid"
+        if mediainfo and mediainfo.douban_id:
+            return "doubanid"
+        if mediainfo and mediainfo.bangumi_id:
+            return "bangumiid"
+        if mediainfo and mediainfo.anilist_id:
+            return "anilistid"
+        if mediainfo and all(resolve_media_identity(media=mediainfo)):
+            return "plugin"
+        return "unknown"
 
     @staticmethod
     def get_states_for_search(state: str) -> str:
@@ -1851,11 +4371,15 @@ class SubscribeChain(ChainBase):
             'year': subscribe.year,
             'type': subscribe.type,
             'season': subscribe.season,
+            'episode_group': subscribe.episode_group,
             'tmdbid': subscribe.tmdbid,
             'imdbid': subscribe.imdbid,
             'tvdbid': subscribe.tvdbid,
             'doubanid': subscribe.doubanid,
-            'bangumiid': subscribe.bangumiid
+            'bangumiid': subscribe.bangumiid,
+            'anilistid': subscribe.anilistid,
+            'media_source': subscribe.media_source,
+            'media_id': subscribe.media_id,
         }
         return f"Subscribe|{json.dumps(source_keyword, ensure_ascii=False)}"
 

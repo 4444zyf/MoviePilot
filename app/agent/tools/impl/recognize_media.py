@@ -6,15 +6,16 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.media import MediaChain
 from app.core.context import Context
 from app.core.metainfo import MetaInfo
 from app.log import logger
+from app.schemas.types import media_type_to_agent
 
 
 class RecognizeMediaInput(BaseModel):
     """识别媒体信息工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     title: Optional[str] = Field(None, description="The title of the torrent/media to recognize (required for torrent recognition)")
     subtitle: Optional[str] = Field(None, description="The subtitle or description of the torrent (optional, helps improve recognition accuracy)")
     path: Optional[str] = Field(None, description="The file path to recognize (required for file recognition, mutually exclusive with title)")
@@ -22,6 +23,11 @@ class RecognizeMediaInput(BaseModel):
 
 class RecognizeMediaTool(MoviePilotTool):
     name: str = "recognize_media"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+        ToolTag.Metadata,
+    ]
     description: str = "Extract/identify media information from torrent titles or file paths (NOT database search). Supports two modes: 1) Extract from torrent title and optional subtitle, 2) Extract from file path. Returns detailed media information. Use 'search_media' to search TMDB database, or 'scrape_metadata' to generate metadata files for existing files."
     args_schema: Type[BaseModel] = RecognizeMediaInput
 
@@ -32,13 +38,13 @@ class RecognizeMediaTool(MoviePilotTool):
         path = kwargs.get("path")
         
         if path:
-            message = f"正在识别文件媒体信息: {path}"
+            message = f"识别文件媒体信息: {path}"
         elif title:
-            message = f"正在识别种子媒体信息: {title}"
+            message = f"识别种子媒体信息: {title}"
             if subtitle:
                 message += f" ({subtitle})"
         else:
-            message = "正在识别媒体信息"
+            message = "识别媒体信息"
         
         return message
 
@@ -48,8 +54,7 @@ class RecognizeMediaTool(MoviePilotTool):
         
         try:
             media_chain = MediaChain()
-            context = None
-            
+
             # 根据提供的参数选择识别方式
             if path:
                 # 文件路径识别
@@ -59,7 +64,10 @@ class RecognizeMediaTool(MoviePilotTool):
                         "message": "文件路径不能为空"
                     }, ensure_ascii=False)
                 
-                context = await media_chain.async_recognize_by_path(path)
+                context = await media_chain.async_recognize_by_path(
+                    path,
+                    obtain_images=False,
+                )
                 if context:
                     return self._format_context_result(context, "文件")
                 else:
@@ -72,7 +80,10 @@ class RecognizeMediaTool(MoviePilotTool):
             elif title:
                 # 种子标题识别
                 metainfo = MetaInfo(title, subtitle)
-                mediainfo = await media_chain.async_recognize_by_meta(metainfo)
+                mediainfo = await media_chain.async_recognize_by_meta(
+                    metainfo,
+                    obtain_images=False,
+                )
                 if mediainfo:
                     context = Context(meta_info=metainfo, media_info=mediainfo)
                     return self._format_context_result(context, "种子")
@@ -98,7 +109,8 @@ class RecognizeMediaTool(MoviePilotTool):
                 "message": error_message
             }, ensure_ascii=False)
 
-    def _format_context_result(self, context: Context, source_type: str) -> str:
+    @staticmethod
+    def _format_context_result(context: Context, source_type: str) -> str:
         """格式化识别结果为JSON字符串"""
         if not context:
             return json.dumps({
@@ -124,12 +136,15 @@ class RecognizeMediaTool(MoviePilotTool):
                 "title": media_info.get("title"),
                 "en_title": media_info.get("en_title"),
                 "year": media_info.get("year"),
-                "type": media_info.get("type"),
+                "type": media_type_to_agent(media_info.get("type")),
                 "season": media_info.get("season"),
                 "tmdb_id": media_info.get("tmdb_id"),
                 "imdb_id": media_info.get("imdb_id"),
                 "douban_id": media_info.get("douban_id"),
                 "bangumi_id": media_info.get("bangumi_id"),
+                "anilist_id": media_info.get("anilist_id"),
+                "media_source": media_info.get("source"),
+                "media_id": media_info.get("media_id"),
                 "overview": media_info.get("overview"),
                 "vote_average": media_info.get("vote_average"),
                 "poster_path": media_info.get("poster_path"),
@@ -145,7 +160,7 @@ class RecognizeMediaTool(MoviePilotTool):
                 "name": meta_info.get("name"),
                 "title": meta_info.get("title"),
                 "year": meta_info.get("year"),
-                "type": meta_info.get("type"),
+                "type": media_type_to_agent(meta_info.get("type")),
                 "begin_season": meta_info.get("begin_season"),
                 "end_season": meta_info.get("end_season"),
                 "begin_episode": meta_info.get("begin_episode"),
@@ -155,8 +170,11 @@ class RecognizeMediaTool(MoviePilotTool):
                 "season_episode": meta_info.get("season_episode"),
                 "episode_list": meta_info.get("episode_list"),
                 "tmdbid": meta_info.get("tmdbid"),
-                "doubanid": meta_info.get("doubanid")
+                "doubanid": meta_info.get("doubanid"),
+                "bangumiid": meta_info.get("bangumiid"),
+                "anilistid": meta_info.get("anilistid"),
+                "media_source": meta_info.get("media_source"),
+                "media_id": meta_info.get("media_id"),
             }
         
         return json.dumps(result, ensure_ascii=False, indent=2)
-

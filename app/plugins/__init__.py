@@ -174,6 +174,21 @@ class _PluginBase(metaclass=ABCMeta):
         """
         pass
 
+    def get_auth_providers(self) -> List[Dict[str, Any]]:
+        """
+        声明插件提供的登录认证入口。
+
+        返回示例：
+        [{
+            "id": "oidc",
+            "name": "OIDC 登录",
+            "icon": "mdi-openid",
+            "component": "AuthPage",
+            "enabled": True
+        }]
+        """
+        pass
+
     def get_module(self) -> Dict[str, Any]:
         """
         获取插件模块声明，用于胁持系统模块实现（方法名：方法实现）
@@ -262,6 +277,20 @@ class _PluginBase(metaclass=ABCMeta):
             plugin_id = self.__class__.__name__
         self.plugindata.save(plugin_id, key, value)
 
+    async def async_save_data(
+        self, key: str, value: Any, plugin_id: Optional[str] = None
+    ) -> None:
+        """
+        异步保存插件数据
+
+        :param key: 数据键
+        :param value: 数据值
+        :param plugin_id: 插件ID
+        """
+        if not plugin_id:
+            plugin_id = self.__class__.__name__
+        await self.plugindata.async_save(plugin_id, key, value)
+
     def get_data(self, key: Optional[str] = None, plugin_id: Optional[str] = None) -> Any:
         """
         获取插件数据
@@ -271,6 +300,20 @@ class _PluginBase(metaclass=ABCMeta):
         if not plugin_id:
             plugin_id = self.__class__.__name__
         return self.plugindata.get_data(plugin_id, key)
+
+    async def async_get_data(
+        self, key: Optional[str] = None, plugin_id: Optional[str] = None
+    ) -> Any:
+        """
+        异步获取插件数据
+
+        :param key: 数据键
+        :param plugin_id: 插件ID
+        :return: 指定键的数据值或插件的全部数据
+        """
+        if not plugin_id:
+            plugin_id = self.__class__.__name__
+        return await self.plugindata.async_get_data(plugin_id, key)
 
     def del_data(self, key: str, plugin_id: Optional[str] = None) -> Any:
         """

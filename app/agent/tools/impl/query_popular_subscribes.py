@@ -7,18 +7,20 @@ import cn2an
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.core.context import MediaInfo
-from app.helper.subscribe import SubscribeHelper
+from app.helper.server import MoviePilotServerHelper
 from app.log import logger
-from app.schemas.types import MediaType
+from app.schemas.types import MediaType, media_type_to_agent
+
+MAX_PAGE_SIZE = 50
 
 
 class QueryPopularSubscribesInput(BaseModel):
     """查询热门订阅工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-    stype: str = Field(..., description="Media type: '电影' for films, '电视剧' for television series")
+    media_type: str = Field(..., description="Allowed values: movie, tv")
     page: Optional[int] = Field(1, description="Page number for pagination (default: 1)")
-    count: Optional[int] = Field(30, description="Number of items per page (default: 30)")
+    count: Optional[int] = Field(30, description="Number of items per page (default: 30, max: 50)")
     min_sub: Optional[int] = Field(None, description="Minimum number of subscribers filter (optional, e.g., 5)")
     genre_id: Optional[int] = Field(None, description="Filter by genre ID (optional)")
     min_rating: Optional[float] = Field(None, description="Minimum rating filter (optional, e.g., 7.5)")
@@ -28,18 +30,23 @@ class QueryPopularSubscribesInput(BaseModel):
 
 class QueryPopularSubscribesTool(MoviePilotTool):
     name: str = "query_popular_subscribes"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Subscription,
+        ToolTag.Recommendation,
+    ]
     description: str = "Query popular subscriptions based on user shared data. Shows media with the most subscribers, supports filtering by genre, rating, minimum subscribers, and pagination."
     args_schema: Type[BaseModel] = QueryPopularSubscribesInput
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         """根据查询参数生成友好的提示消息"""
-        stype = kwargs.get("stype", "")
+        media_type = kwargs.get("media_type", "")
         page = kwargs.get("page", 1)
         min_sub = kwargs.get("min_sub")
         min_rating = kwargs.get("min_rating")
         max_rating = kwargs.get("max_rating")
         
-        parts = [f"正在查询热门订阅 [{stype}]"]
+        parts = [f"查询热门订阅 [{media_type}]"]
         
         if min_sub:
             parts.append(f"最少订阅: {min_sub}")
@@ -52,7 +59,7 @@ class QueryPopularSubscribesTool(MoviePilotTool):
         
         return " | ".join(parts) if len(parts) > 1 else parts[0]
 
-    async def run(self, stype: str,
+    async def run(self, media_type: str,
                   page: Optional[int] = 1,
                   count: Optional[int] = 30,
                   min_sub: Optional[int] = None,
@@ -61,7 +68,7 @@ class QueryPopularSubscribesTool(MoviePilotTool):
                   max_rating: Optional[float] = None,
                   sort_type: Optional[str] = None, **kwargs) -> str:
         logger.info(
-            f"执行工具: {self.name}, 参数: stype={stype}, page={page}, count={count}, min_sub={min_sub}, "
+            f"执行工具: {self.name}, 参数: media_type={media_type}, page={page}, count={count}, min_sub={min_sub}, "
             f"genre_id={genre_id}, min_rating={min_rating}, max_rating={max_rating}, sort_type={sort_type}")
 
         try:
@@ -69,10 +76,14 @@ class QueryPopularSubscribesTool(MoviePilotTool):
                 page = 1
             if count is None or count < 1:
                 count = 30
+            # 外部统计接口支持传入 count，这里做硬上限，避免 Agent 一次拉取过多结果。
+            count = min(count, MAX_PAGE_SIZE)
+            media_type_enum = MediaType.from_agent(media_type)
+            if not media_type_enum:
+                return f"错误：无效的媒体类型 '{media_type}'，支持的类型：'movie', 'tv'"
 
-            subscribe_helper = SubscribeHelper()
-            subscribes = await subscribe_helper.async_get_statistic(
-                stype=stype,
+            subscribes = await MoviePilotServerHelper.async_get_subscribe_statistic(
+                stype=media_type_enum.to_agent(),
                 page=page,
                 count=count,
                 genre_id=genre_id,
@@ -94,12 +105,20 @@ class QueryPopularSubscribesTool(MoviePilotTool):
                     continue
 
                 media = MediaInfo()
-                media.type = MediaType(sub.get("type"))
+                raw_type = str(sub.get("type") or "").strip().lower()
+                if raw_type in ["movie", "电影"]:
+                    media.type = MediaType.MOVIE
+                elif raw_type in ["tv", "电视剧"]:
+                    media.type = MediaType.TV
+                else:
+                    # 跳过无法识别类型的数据，避免单条脏数据导致整批失败
+                    logger.warning(f"跳过未知媒体类型: {sub.get('type')}")
+                    continue
                 media.tmdb_id = sub.get("tmdbid")
                 # 处理标题
                 title = sub.get("name")
                 season = sub.get("season")
-                if season and int(season) > 1 and media.tmdb_id:
+                if season not in (None, "") and int(season) != 1 and media.tmdb_id:
                     # 小写数据转大写
                     season_str = cn2an.an2cn(season, "low")
                     title = f"{title} 第{season_str}季"
@@ -107,6 +126,8 @@ class QueryPopularSubscribesTool(MoviePilotTool):
                 media.year = sub.get("year")
                 media.douban_id = sub.get("doubanid")
                 media.bangumi_id = sub.get("bangumiid")
+                media.anilist_id = sub.get("anilistid")
+                media.source = sub.get("media_source")
                 media.tvdb_id = sub.get("tvdbid")
                 media.imdb_id = sub.get("imdbid")
                 media.season = sub.get("season")
@@ -124,12 +145,15 @@ class QueryPopularSubscribesTool(MoviePilotTool):
             for media in ret_medias:
                 media_dict = media.to_dict()
                 simplified = {
-                    "type": media_dict.get("type"),
+                    "type": media_type_to_agent(media_dict.get("type")),
                     "title": media_dict.get("title"),
                     "year": media_dict.get("year"),
                     "tmdb_id": media_dict.get("tmdb_id"),
                     "douban_id": media_dict.get("douban_id"),
                     "bangumi_id": media_dict.get("bangumi_id"),
+                    "anilist_id": media_dict.get("anilist_id"),
+                    "media_source": media_dict.get("source"),
+                    "media_id": media_dict.get("media_id"),
                     "tvdb_id": media_dict.get("tvdb_id"),
                     "imdb_id": media_dict.get("imdb_id"),
                     "season": media_dict.get("season"),
@@ -149,4 +173,3 @@ class QueryPopularSubscribesTool(MoviePilotTool):
         except Exception as e:
             logger.error(f"查询热门订阅失败: {e}", exc_info=True)
             return f"查询热门订阅时发生错误: {str(e)}"
-

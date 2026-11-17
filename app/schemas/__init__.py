@@ -1,3 +1,4 @@
+from .agent import *
 from .context import *
 from .dashboard import *
 from .download import *
@@ -11,6 +12,7 @@ from .monitoring import *
 from .plugin import *
 from .response import *
 from .rule import *
+from .openai import *
 from .servarr import *
 from .servcookie import *
 from .site import *
@@ -23,4 +25,3 @@ from .transfer import *
 from .user import *
 from .workflow import *
 from .mcp import *
-
